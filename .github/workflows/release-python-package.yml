@@ -9,7 +9,6 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-22.04
     uses: ./.github/workflows/test-python-package.yml
     with:
       package: ${{ inputs.package }}
