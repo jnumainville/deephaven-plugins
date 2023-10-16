@@ -10,11 +10,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-22.04
-    steps:
-      - name: Run tests
-        uses: ./.github/workflows/test-python-package.yml
-        with:
-          package: ${{ inputs.package }}
+    uses: ./.github/workflows/test-python-package.yml
+    with:
+      package: ${{ inputs.package }}
 
   build-dist:
     needs: test
