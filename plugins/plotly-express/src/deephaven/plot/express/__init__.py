@@ -6,6 +6,8 @@ from typing import Any
 from deephaven.plugin.object_type import BidirectionalObjectType, MessageStream
 from plotly.graph_objs import Figure
 
+# test
+
 from .communication.DeephavenFigureConnection import DeephavenFigureConnection
 from .deephaven_figure import DeephavenFigure
 
