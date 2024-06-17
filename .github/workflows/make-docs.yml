@@ -45,4 +45,4 @@ jobs:
         with:
           rclone_config: ${{ secrets.RCLONE_CONFIG }}
 
-      - run: rclone listremotes
+      - run: rclone -vv listremotes
