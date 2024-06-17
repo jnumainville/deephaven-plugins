@@ -45,4 +45,4 @@ jobs:
         with:
           rclone_config: ${{ secrets.RCLONE_CONFIG }}
 
-      - run: rclone sync plugins/${{ inputs.package }}/docs/build/markdown/ plugindocs:website/deephaven/deephaven-plugins/${{ inputs.package }}/${{ inputs.version }}/
+      - run: rclone listremotes
