@@ -1,0 +1,23 @@
+name: Build Main Docs
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        required: true
+        type: string
+
+jobs:
+  build-plugin:
+    if: ${{ inputs.package == 'plotly-express' }}
+    uses: ./.github/workflows/build-python-package.yml
+    with:
+      package: ${{ inputs.package }}
+
+  main-docs:
+    needs: build-plugin
+    uses: ./.github/workflows/make-docs.yml
+    with:
+      package: ${{ inputs.package }}
+      version: 'main'
+
