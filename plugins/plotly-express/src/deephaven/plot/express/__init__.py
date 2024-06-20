@@ -9,6 +9,8 @@ from plotly.graph_objs import Figure
 from .communication.DeephavenFigureConnection import DeephavenFigureConnection
 from .deephaven_figure import DeephavenFigure
 
+# test
+
 from .plots import (
     area,
     bar,
