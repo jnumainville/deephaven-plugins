@@ -9,7 +9,7 @@ from plotly.graph_objs import Figure
 from .communication.DeephavenFigureConnection import DeephavenFigureConnection
 from .deephaven_figure import DeephavenFigure
 
-# test2
+# test
 
 from .plots import (
     area,
