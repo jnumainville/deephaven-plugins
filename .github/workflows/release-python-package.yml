@@ -49,12 +49,6 @@ jobs:
           VERSION=$(python -c 'import pkginfo; print(pkginfo.Wheel("${{ steps.get_whl.outputs.whl_path }}").version)')
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
-      - name: Publish package
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: plugins/${{ inputs.package }}/dist/
-          repository-url: https://test.pypi.org/legacy/
-
   check-make-docs:
     runs-on: ubuntu-22.04
     outputs:
