@@ -1,44 +1,93 @@
-# Unified Plotting Library — Design Plan
+# Visualization IR — An Architecture for Portable Visualizations
 
-Status: design proposal (iterate on specifics; core decisions are committed)
-Scope: a single, delta-aware, high-performance, column-oriented plotting
-library exposing a shared Python API over a declarative JSON model, rendered on
-WebGPU (with a WebGL2 fallback), and optimized for — but not bound to — the
-Deephaven ticking-table engine.
+Status: design proposal (opinionated; core decisions are committed)
+Scope: not “yet another plotting library” but an **architecture for visualization**
+— a backend-independent **Visualization Intermediate Representation (VIR)** that
+many frontends (Python, TypeScript, Julia, R, AI agents) compile to and many
+renderers (WebGPU, SVG, Canvas, PNG/PDF/HTML, and existing libraries such as
+Plotly, Vega, ECharts, deck.gl) consume. Delta-aware, column-oriented, GPU-first,
+and optimized for — but not bound to — the Deephaven ticking-table engine.
 
-This document specifies the architecture, the chart model, the resolution and
-delta pipelines, and a committed set of design decisions. It is intentionally
-lower-level than a napkin vision but higher-level than a spec: each numbered
+> **Thesis: a visualization is a data structure, not an API.** The long-term goal
+> is to make visualizations _portable artifacts rather than executable code_ — a
+> visualization should be compilable, serializable, optimizable, transportable,
+> and renderable across languages, runtimes, and rendering engines.
+
+Most libraries are APIs that _produce_ visualizations. This project treats a
+visualization as a durable, structured artifact that can be created, transformed,
+analyzed, transported, optimized, cached, diffed, persisted, and rendered by
+different systems. Nearly everything that makes the project distinctive —
+serialization, AI generation, plugins, multi-language frontends, backend
+independence, compiler-style optimization, diffing — follows from that one shift.
+
+This document specifies the IR, the compiler pipeline, the semantic/chart model,
+the resolution and delta pipelines, and a committed set of design decisions. It
+is lower-level than a napkin vision but higher-level than a spec: each numbered
 component is expected to graduate into its own detailed design doc. Where the
 original brainstorm left questions open, this revision **resolves them** and
 records the rationale in the decision log (§13).
 
 ---
 
-## 1. Objectives and Non-Goals
+## 1. Principles and Non-Goals
 
-### 1.1 Objectives
+### 1.1 First principles
 
-1. **Delta-aware.** Every data and configuration change propagates as a minimal
-   patch. The renderer never re-materializes a chart it can incrementally update.
-2. **High performance.** GPU-resident columnar buffers; downsampling and
-   level-of-detail are first-class, not add-ons. Target: interactive frame rates
-   on tens of millions of points, bounded by pixels and GPU memory, not row count.
-3. **Flexible and extensible.** A permissive low-level model that gatekeeps
-   nothing, plus opinionated high-level APIs. New geoms, scales, stats, engines,
-   and renderers are registrable without forking the core.
-4. **Column-based.** Data is columnar end-to-end (Arrow-compatible). The engine
-   performs aggregation, binning, and downsampling; the client renders results.
-5. **Legible to agents and humans.** The JSON model is declarative, addressable
-   by stable IDs, inheritable via classes, and **compilable** to a fully resolved,
-   provenance-annotated form for debugging and machine reasoning.
+1. **A visualization is a data structure, not an API.** The canonical artifact is
+   the VIR (§2). The Python (or any) API is a _frontend that emits VIR_; it never
+   holds behavior the IR cannot express.
+2. **Declarative over imperative.** You describe _what the visualization is_; the
+   compiler decides _how_ to execute and render it — no
+   `add_trace` / `update_layout` / `update_xaxis` mutation ladder.
+3. **Specifications are immutable; transformations produce new specifications.**
+   `add axis`, `change encoding`, `facet`, `aggregate` are pure functions
+   `VIR → VIR`. This makes caching, undo/redo, diffing, collaboration, and AI
+   editing clean.
+4. **Serialization is a primary goal, not a feature.** The IR round-trips to disk,
+   websocket, git, cache, notebook output, and AI prompt. JSON is _one encoding_
+   of the IR, not the IR itself (§2.4).
+5. **Legible to humans and agents equally.** The IR is deterministic,
+   schema-validated, explicit, minimally ambiguous, and introspectable — because
+   an LLM (and a human reading a GitHub diff) will read and write it directly.
+6. **Plots reference data; they do not own it.** A mark binds a channel to
+   `table.column`, not to an array of values. The IR stays tiny; the execution
+   engine decides what to materialize (§2.5). This is what makes 100M-row inputs
+   ordinary rather than an edge case.
+7. **Column-native and GPU-first.** Columns (Arrow-compatible) are the _data
+   model_, not a serialization detail — they make SIMD, GPU upload, filtering,
+   aggregation, and Deephaven integration natural. The renderer assumes GPUs
+   exist (WebGPU primary).
+8. **Thin frontends, heavy execution.** Frontends construct specifications; the
+   engine / native kernel executes them (§21). Python is not thousands of lines of
+   rendering logic.
+9. **Charts aren’t special.** Scatter, maps, financial charts, node/network
+   graphs, timelines, scientific viz, arbitrary JS visualizations, and custom
+   marks live under one abstraction and one IR.
+10. **Backends and frontends are replaceable.** New renderers and new source
+    languages plug in without touching the core (§2.6–§2.7). Plotly, Vega, and
+    ECharts can be _backends_, not competitors.
+11. **Expressive but ergonomic.** A grammar of graphics powerful enough to
+    describe any visualization, without inheriting the ceremony of Vega or the
+    steep edges of classic grammar-of-graphics systems. The goal is a
+    _visualization language_, not “ggplot in Python.”
+12. **Interaction is part of the specification.** Selection → crossfilter →
+    highlight → linked views are declared in the IR, not bolted on as ad-hoc
+    `onclick` callbacks (§19).
 
-### 1.2 Non-Goals
+### 1.2 What this is — and is not
 
-- Not a general 2D scene/illustration tool; shapes exist to serve charts.
+**This is not primarily** a plotting library, a renderer, or a chart-widget
+toolkit. **It is an architecture** for describing, validating, transporting,
+optimizing, and rendering visualizations across languages and execution
+environments.
+
+Non-goals (bounded scope, so the core stays sharp):
+
+- Not a general 2D scene/illustration tool; shapes exist to serve visualizations.
 - Not a dashboarding/layout framework beyond what charts and subcharts require.
-- Not committed to reproducing every exotic chart type; breadth is bounded by
-  what the columnar + GPU + delta model can serve performantly (§14 gate).
+- Not committed to reproducing every exotic chart type in the _core_; breadth
+  arrives through plugins (§2.7) and is bounded by what the columnar + GPU + delta
+  model can serve performantly (§1.3 gate).
 
 ### 1.3 The performance / flexibility / extensibility gate
 
@@ -54,34 +103,143 @@ Every feature in this plan must pass three tests, or it is cut or deferred:
 
 ---
 
-## 2. System Architecture
+## 2. The Visualization IR and the Compiler Pipeline
+
+The **Visualization Intermediate Representation (VIR)** is the canonical form of a
+visualization. Frontends compile _to_ it; renderers consume it; optimization
+passes rewrite it. Nothing downstream depends on which language authored it.
 
 ```mermaid
 flowchart TD
-    A[High-level Python API<br/>opinionated, fixes geoms/typing] --> B[Low-level Python API<br/>1:1 with the JSON model]
-    B --> C[Chart Document<br/>classes, encodings, geoms, scales, coords, layout]
-    C --> D[Resolver / Compiler<br/>class linearization, encoding->geom, provenance]
-    D --> E[Query Planner<br/>server/client op negotiation, budgets]
-    E --> F[Engine Adapter<br/>Deephaven default; pluggable]
-    F --> G[Delta Producer<br/>table ticks -> model+data patches]
-    G --> H[Scene Compiler<br/>resolved doc -> GPU scene graph]
-    H --> I[Renderer Backend<br/>WebGPU primary / WebGL2 fallback / SVG export]
-    I --> J[Interaction & Event Bus<br/>hover, select, zoom, callbacks]
-    J --> C
+    subgraph Frontends
+      P[Python] --- TS[TypeScript] --- JU[Julia] --- RR[R] --- AIx[AI agent]
+    end
+    Frontends --> IR[Visualization IR<br/>semantic, backend-independent]
+    IR --> SV[Semantic validation<br/>schema + rules]
+    SV --> OPT[Optimization passes<br/>LOD, fusion, pruning, batching, caching]
+    OPT --> LOW[Backend lowering]
+    LOW --> B1[WebGPU] & B2[WebGL2] & B3[SVG / Canvas] & B4[PNG / PDF / HTML] & B5[Plotly / Vega / ECharts / deck.gl]
 ```
 
-Component responsibilities and the contracts between them:
+### 2.1 A compiler, not a plotting engine
+
+The pipeline borrows compiler structure deliberately — it is closer to LLVM than
+to matplotlib:
+
+```
+Frontend (Python / TS / Julia / R / AI)
+        │  emits VIR
+Semantic validation            ← schema + rules; user feedback before rendering
+        │
+Optimization passes (VIR → VIR)
+        │
+Backend lowering               ← VIR → execution graph for a target
+        │
+Execution                      ← engine materializes data; renderer draws
+```
+
+Each stage has a stable contract, so stages can be tested, cached, and swapped
+independently.
+
+### 2.2 Two graphs: semantic vs. execution
+
+There are two distinct graphs, and conflating them is the mistake most libraries
+make:
+
+- **Semantic graph (the VIR)** — _what_ the visualization is. Serializable,
+  immutable, human/agent-legible:
+  `scatter { x = price, y = volume, color = sector }`.
+- **Execution graph** — _how_ to produce pixels: read columns → compute domains →
+  aggregate → LOD reduction → GPU upload → draw. **Regenerated on demand**, never
+  serialized, never authored by hand.
+
+The VIR **preserves semantics to the last possible stage**: a scatter stays a
+`scatter` through save / load / transport and only becomes "SVG path #18" at
+backend lowering. That is what keeps artifacts editable, diffable, and
+explainable.
+
+### 2.3 Optimization passes
+
+Because the VIR is a data structure, optimization is a set of `VIR → VIR` (and
+lowering-time) passes, each independently testable:
+
+- **Level of detail** — insert decimation/aggregation tiers (§5).
+- **Transform fusion** — collapse chained stats/filters into one engine op.
+- **Constant folding** — resolve static scales/domains/layout at compile time.
+- **Viewport pruning** — drop data and marks outside the visible window.
+- **Batching** — merge compatible marks into single draw calls.
+- **Caching / CSE** — deduplicate identical data references and derived buffers
+  (ties to the transfer cache, §7.1).
+
+### 2.4 Serialization is a primary design goal
+
+Serialization is not "we support JSON." It is the point. The same VIR must save to
+disk, stream over a websocket, be generated by an AI, `git diff` cleanly, support
+collaboration, transport browser↔server, cache, and embed in notebook outputs.
+
+Therefore: **JSON is one _encoding_ of the VIR, not the VIR itself.** The IR is an
+abstract structure with a canonical schema; JSON is the default human-readable
+encoding (readable in a GitHub diff — an explicit goal), and a compact binary
+encoding (Arrow / FlatBuffers / protobuf-style) is available for hot transport.
+Both decode to the identical IR. This is deliberately _not_ a protobuf-first API:
+humans must be able to open the artifact and understand it.
+
+### 2.5 Query-based rendering: reference data, don't own it
+
+A visualization **references** data; it never contains it:
+
+```
+scatter { x = trades.price, y = trades.volume }   // references, not 100M rows
+```
+
+The IR carries column _references_ (source + column + optional derivation), not
+arrays. Structure and numeric data are cleanly separated: the structure
+serializes and stays tiny; the data stays in Arrow / Deephaven / pandas / Polars.
+The execution engine decides what to materialize (viewport- and LOD-bounded), so
+100M-row inputs are ordinary. See §6 for the data model and §3.3 for channels.
+
+### 2.6 Backends are replaceable
+
+A backend implements one interface: _consume lowered VIR, produce output +
+hit-testing_. Built-ins: WebGPU (primary), WebGL2, SVG/Canvas2D, and static
+PNG/PDF/HTML. Crucially, **existing libraries can be backends** — a Plotly, Vega,
+ECharts, or deck.gl backend lowers the VIR onto that library instead of competing
+with it. Backend independence means one visualization becomes HTML, PNG, SVG,
+notebook, browser, or desktop **without changing user code**.
+
+### 2.7 Multiple frontends and a plugin ecosystem
+
+- **Frontends** are thin: Python, TypeScript, Julia, R, and AI agents all emit the
+  same VIR, so a visualization authored in one language is reproducible from
+  another.
+- **Plugins** extend the core without forking the language: domain bundles for
+  financial, mapping, graph/network, timeline, and scientific visualization, plus
+  new geoms, scales, coords, stats, engine adapters, and renderer backends. The
+  core language stays small; breadth lives in plugins.
+
+### 2.8 Stable specification (forward compatibility)
+
+**A visualization serialized today should load in future versions.** The VIR
+carries a schema version; the resolver runs forward migrations (§13 #10). This
+promise is what makes the IR safe to embed in notebooks, dashboards, saved
+artifacts, and AI-generated outputs that must survive library upgrades. It also
+makes documentation nearly free: an example _is_ its VIR.
+
+### 2.9 Component contracts and threading
+
+The runtime realizes the pipeline as these components (the frontend emits the
+VIR; every stage below operates on it):
 
 | Component        | Input                      | Output                         | Contract                                                            |
 | ---------------- | -------------------------- | ------------------------------ | ------------------------------------------------------------------- |
-| Low-level API    | Python calls               | Chart Document (JSON)          | Everything expressible in JSON; no hidden capabilities.             |
+| Frontend         | author calls (any lang)    | VIR (an encoding)              | Emits VIR only; no behavior the IR cannot express.                  |
 | Resolver         | Document                   | Resolved Document + provenance | Deterministic; pure function of the document + registry.            |
 | Query Planner    | Resolved Document          | Op plan (server vs. client)    | Cost-based; respects capability flags and budgets (§8).             |
 | Engine Adapter   | Op plan + table refs       | Columnar result handles        | Abstract ops (bin, aggregate, downsample); Deephaven default.       |
 | Delta Producer   | Engine updates             | Model patch + data patch       | RFC 6902-style model patches; columnar row-range data patches (§7). |
 | Scene Compiler   | Resolved Document + data   | GPU scene graph                | Backend-agnostic; no DOM/GPU calls itself.                          |
 | Renderer Backend | Scene graph + data buffers | Pixels + hit-test structures   | Swappable (WebGPU/WebGL2/SVG); identical scene-graph interface.     |
-| Event Bus        | Pointer/keyboard, engine   | Model patches + user callbacks | Interactions are model mutations; round-trip through the document.  |
+| Event Bus        | Pointer/keyboard, engine   | Model patches + user callbacks | Interactions are model mutations; round-trip through the VIR.       |
 
 **Threading.** The resolver, planner, delta producer, and scene compiler run in
 a worker; the renderer owns the GPU device. The main thread only marshals
@@ -90,11 +248,15 @@ delta work off the UI thread (satisfies the "warn if slow, never block" goal).
 
 ---
 
-## 3. The Chart Document
+## 3. The Visualization IR (Document Model)
 
-The Chart Document is the single source of truth. It is a JSON object with a
-versioned schema (published as JSON Schema for validation, editor generation,
-and agent tool-use). Its top-level shape:
+The VIR — informally “the document” — is the single semantic source of truth: an
+**immutable, schema-validated data structure**. JSON is its default
+human-readable encoding (§2.4), and the shape below is that encoding; a compact
+binary encoding decodes to the identical IR. Transformations produce a _new_
+document rather than mutating in place, and the schema is versioned for forward
+compatibility (§2.8). The published JSON Schema drives validation, editor
+generation, and agent tool-use. Its top-level shape:
 
 ```
 Document
@@ -606,25 +768,30 @@ inheritance and inference explicit:
 
 ## 13. Decision Log (resolved questions & conflicts)
 
-| #   | Question / conflict                                 | Decision                                                                                                                                             |
-| --- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Grammar vs. trace as the core model                 | **Grammar core** (channels + geoms + stats + scales). Traces are a _compiled artifact_.                                                              |
-| 2   | Deep vs. shallow inheritance; is nesting allowed?   | **Flat class registry**, linear `extends`, C3 linearization; **no nested class trees**. Explicit merge algebra (§3.8).                               |
-| 3   | Server-side vs. client-side ops                     | **Capability- + cost-based planner** (§8); server-side default on Deephaven; fail loudly if impossible.                                              |
-| 4   | WebGPU-only vs. fallback                            | **WebGPU primary + WebGL2 fallback + SVG export**, one scene-graph interface (§4).                                                                   |
-| 5   | How much typing inference is "magic"                | **Deterministic arity table** (§3.3); inference writes the geom back into the compiled doc; high-level API may pin it.                               |
-| 6   | Delta granularity                                   | **Column/row-range default**, point-level opt-in; two channels (model + data); frame-coalesced, atomic (§7).                                         |
-| 7   | Layout language ("CSS-like" without CSS complexity) | **Single-pass constraint box model** with `fr`/`px`/`%`/`auto` + edge attachment + grid; boxes materialized in compiled doc (§3.5).                  |
-| 8   | Series vs. shapes as separate concepts              | **Unified marks** vocabulary; a series is a shape templated over data (§3.2).                                                                        |
-| 9   | Backend feature-parity leakage (Plots.jl trap)      | **Capability flags** + early hard failure with diagnostics; never silent degradation (§8/§9).                                                        |
-| 10  | Model versioning/migration                          | **Versioned schema** with forward migrations run by the resolver; documents declare `version`.                                                       |
-| 11  | Numeric precision on the GPU                        | **Offset-encoded f32** with f64/i64 canonical on CPU; per-trace/axis `offset+scale`; deep-zoom re-centering; ticks/hover never f32 (§20).            |
-| 12  | External CSS / Tailwind styling                     | **Three-surface model:** DOM chrome = plain CSS; marks = `--chart-*` custom-property token bridge; per-mark data-driven = spec-level (§18).          |
-| 13  | Filtering, selection & linked views                 | **Three-tier filter model** (indexed range / visible-window re-bin / Falcon summed-area cube) + per-row selection bitmask; Deephaven pushdown (§19). |
-| 14  | Wire efficiency                                     | **Content-addressed, generation+filter-keyed immutable cache** with manifest handshake — never send the same bytes twice (§7.1).                     |
-| 15  | Null / gap semantics                                | **Arrow validity bitmaps** end-to-end; NaN never reaches vertex buffers; null inside a line = gap (§20).                                             |
-| 16  | Interaction latency                                 | Pan/zoom = uniform-only same-frame; tier rebuild non-blocking via **stale-while-revalidate + progressive refinement**; async GPU picking (§5.2/§20). |
-| 17  | Big-data tier ladder                                | **Direct → decimated → data-space tile pyramid → out-of-core tiling**; tier chosen on count _and_ fill-rate; chunked buffers (§5.1).                 |
+| #   | Question / conflict                                 | Decision                                                                                                                                                   |
+| --- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Grammar vs. trace as the core model                 | **Grammar core** (channels + geoms + stats + scales). Traces are a _compiled artifact_.                                                                    |
+| 2   | Deep vs. shallow inheritance; is nesting allowed?   | **Flat class registry**, linear `extends`, C3 linearization; **no nested class trees**. Explicit merge algebra (§3.8).                                     |
+| 3   | Server-side vs. client-side ops                     | **Capability- + cost-based planner** (§8); server-side default on Deephaven; fail loudly if impossible.                                                    |
+| 4   | WebGPU-only vs. fallback                            | **WebGPU primary + WebGL2 fallback + SVG export**, one scene-graph interface (§4).                                                                         |
+| 5   | How much typing inference is "magic"                | **Deterministic arity table** (§3.3); inference writes the geom back into the compiled doc; high-level API may pin it.                                     |
+| 6   | Delta granularity                                   | **Column/row-range default**, point-level opt-in; two channels (model + data); frame-coalesced, atomic (§7).                                               |
+| 7   | Layout language ("CSS-like" without CSS complexity) | **Single-pass constraint box model** with `fr`/`px`/`%`/`auto` + edge attachment + grid; boxes materialized in compiled doc (§3.5).                        |
+| 8   | Series vs. shapes as separate concepts              | **Unified marks** vocabulary; a series is a shape templated over data (§3.2).                                                                              |
+| 9   | Backend feature-parity leakage (Plots.jl trap)      | **Capability flags** + early hard failure with diagnostics; never silent degradation (§8/§9).                                                              |
+| 10  | Model versioning/migration                          | **Versioned schema** with forward migrations run by the resolver; documents declare `version`.                                                             |
+| 11  | Numeric precision on the GPU                        | **Offset-encoded f32** with f64/i64 canonical on CPU; per-trace/axis `offset+scale`; deep-zoom re-centering; ticks/hover never f32 (§20).                  |
+| 12  | External CSS / Tailwind styling                     | **Three-surface model:** DOM chrome = plain CSS; marks = `--chart-*` custom-property token bridge; per-mark data-driven = spec-level (§18).                |
+| 13  | Filtering, selection & linked views                 | **Three-tier filter model** (indexed range / visible-window re-bin / Falcon summed-area cube) + per-row selection bitmask; Deephaven pushdown (§19).       |
+| 14  | Wire efficiency                                     | **Content-addressed, generation+filter-keyed immutable cache** with manifest handshake — never send the same bytes twice (§7.1).                           |
+| 15  | Null / gap semantics                                | **Arrow validity bitmaps** end-to-end; NaN never reaches vertex buffers; null inside a line = gap (§20).                                                   |
+| 16  | Interaction latency                                 | Pan/zoom = uniform-only same-frame; tier rebuild non-blocking via **stale-while-revalidate + progressive refinement**; async GPU picking (§5.2/§20).       |
+| 17  | Big-data tier ladder                                | **Direct → decimated → data-space tile pyramid → out-of-core tiling**; tier chosen on count _and_ fill-rate; chunked buffers (§5.1).                       |
+| 18  | What the project _is_                               | **An architecture (Visualization IR + compiler), not a plotting library.** Frontends emit VIR; renderers consume it; passes rewrite it (§2).               |
+| 19  | Semantic vs. execution model                        | **Two graphs:** VIR (semantic, serialized, immutable) vs. execution graph (regenerated, never serialized); semantics preserved to backend lowering (§2.2). |
+| 20  | Data ownership                                      | **Plots reference data, never own it** — column references, not arrays; structure serializes, data stays in Arrow/Deephaven (§2.5).                        |
+| 21  | Encoding vs. IR                                     | **JSON is one encoding of the VIR**, not the IR; binary encoding for hot transport; both decode to the same structure (§2.4).                              |
+| 22  | Existing JS/py libraries                            | **Plotly / Vega / ECharts / deck.gl are candidate _backends_,** not competitors — they are lowering targets for the VIR (§2.6).                            |
 
 ---
 
@@ -632,6 +799,18 @@ inheritance and inference explicit:
 
 Only features that pass the performant/flexible/extensible gate are listed. Each
 is expressible in the JSON model and reducible to columnar/GPU or engine ops.
+
+**Architecture & portability**
+
+- Visualization IR as the canonical artifact; JSON (human) + binary (transport)
+  encodings of one structure.
+- Immutable specs; transformations are `VIR → VIR` (undo/redo, diff, cache).
+- Compiler pipeline with named, testable optimization passes (LOD, fusion,
+  constant folding, viewport pruning, batching, CSE).
+- Multi-language frontends (Python, TypeScript, Julia, R, AI) emitting one IR.
+- Replaceable backends, including Plotly/Vega/ECharts/deck.gl as lowering targets.
+- Forward-compatible schema; example charts double as documentation.
+- Plugin domain bundles: financial, mapping, graph/network, timeline, scientific.
 
 **Core data-visual**
 

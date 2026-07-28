@@ -478,7 +478,7 @@ parentheses (e.g. §3.8) reference the design plan.
 
 - [ ] **12.1 Content-addressed, generation-keyed cache.** Give every transferable
       unit an immutable ID `(source, tier, tile|chunk, data_generation,
-    filter_hash)`; LRU-evict under a byte budget. (plan §7.1)
+  filter_hash)`; LRU-evict under a byte budget. (plan §7.1)
       **Done when:** a changed tile produces a new ID (never an overwrite) and a
       re-request of a held ID transfers 0 bytes.
 
@@ -539,6 +539,65 @@ parentheses (e.g. §3.8) reference the design plan.
       server for export parity. (plan §18)
       **Done when:** a chart inherits the app theme with no per-chart config, and a
       kernel-side export matches the on-screen CSS theme.
+
+---
+
+## Phase 14 — Visualization IR, Compiler Passes & Backends
+
+This phase makes the "visualization is a data structure" thesis real. Much of it
+underpins Phase 1; sequence it alongside the model spike.
+
+- [ ] **14.1 VIR canonical schema + dual encodings.** Define the IR abstractly and
+      provide JSON (human) and a compact binary (transport) encoding that both
+      decode to the identical structure. (plan §2.4, §2.8)
+      **Done when:** a corpus of documents round-trips JSON↔IR↔binary with
+      structural equality, and the JSON is human-readable in a diff.
+
+- [ ] **14.2 Immutable transformation API.** Implement `VIR → VIR` transforms
+      (`add_axis`, `set_encoding`, `facet`, `aggregate`, …) that never mutate the
+      input; pair with a structural diff. (plan §1.1, §2.2)
+      **Done when:** transforms return new documents (input unchanged, asserted),
+      and diffing two documents yields a minimal, human-readable patch.
+
+- [ ] **14.3 Semantic validation pass.** Validate schema + cross-node rules and
+      emit precise, user-facing diagnostics before any rendering. (plan §2.1)
+      **Done when:** invalid documents fail with node-addressed messages and a
+      valid corpus passes; validation runs independently of the renderer.
+
+- [ ] **14.4 Optimization-pass framework + named passes.** A pass manager running
+      ordered, individually testable `VIR → VIR` passes: LOD, transform fusion,
+      constant folding, viewport pruning, batching, CSE. (plan §2.3)
+      **Done when:** each pass has a before/after golden test, passes compose
+      deterministically, and disabling a pass changes only its expected output.
+
+- [ ] **14.5 Backend-lowering interface.** Define the "consume lowered VIR →
+      output + hit-testing" contract shared by all backends. **Depends on:** 3.1.
+      (plan §2.6)
+      **Done when:** the WebGPU backend and one non-GPU backend implement the same
+      interface and pass a shared conformance suite.
+
+- [ ] **14.6 Library-as-backend adapter (Plotly or Vega).** Lower the VIR onto an
+      existing library to prove backends can be third-party. **Depends on:** 14.5.
+      (plan §2.6)
+      **Done when:** a representative document renders through the adapter and
+      preserves semantics (a scatter stays a scatter in the target's model).
+
+- [ ] **14.7 Second frontend conformance.** A second frontend (e.g. TypeScript)
+      emits VIR for a shared set of visualizations. (plan §2.7)
+      **Done when:** the second frontend produces documents structurally identical
+      to the Python frontend for the shared corpus.
+
+- [ ] **14.8 Data-reference model (no inline arrays).** Marks carry column
+      _references_ (source + column + derivation), and the planner materializes
+      only viewport/LOD-bounded windows. (plan §2.5, §6)
+      **Done when:** a 100M-row source renders with the serialized document under a
+      fixed small byte size and no inline data, verified by test.
+
+- [ ] **14.9 Plugin domain bundle (proof).** Ship one domain plugin (e.g.
+      financial or graph/network) registering geoms/coords/marks without core
+      changes. (plan §2.7)
+      **Done when:** the plugin adds a working visualization type via public
+      extension points only, with no edits to core packages.
 
 ---
 
