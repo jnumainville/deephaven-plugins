@@ -260,6 +260,19 @@ also how alternate charting backends (§9) plug in.
 - Data lives in **GPU-resident columnar buffers**; scale changes update uniforms
   (cheap), data changes update buffer sub-ranges (delta), and only geometry
   affected by a patch is re-encoded.
+- **GPU precision (offset-encoded f32):** the canonical store keeps source dtype
+  (i64 timestamps, f64) on the CPU; the GPU receives _relative_ f32 via a
+  per-trace/axis `offset + scale` folded into the view transform (f64 on CPU).
+  This preserves the 4-byte GPU footprint _and_ full precision for
+  large-magnitude/small-delta domains (time, finance, geo); deep zoom re-centers
+  the offset. Axis ticks and hover readouts are computed in f64/i64 and never go
+  through f32. (See §20; borrowed from deck.gl RTC / reflex `xy`.)
+- **GPU picking:** hover/select render integer IDs to an offscreen target with
+  async readback — O(1) regardless of point count, no per-point CPU scan.
+- **Real GPU ceilings:** tier selection considers not just point count but
+  fill-rate (`count × mark_pixel_area × overdraw`) and the ~1 GB single-allocation
+  cap; large buffers are chunked (multi-buffer draws) so the allocation cliff is
+  unreachable.
 
 ---
 
@@ -279,6 +292,45 @@ Downsampling is a first-class primitive and an engine-abstracted op:
 - **Placement:** the planner prefers **server-side** reduction on Deephaven so
   only the pixels-worth of data crosses the wire, with client-side reduction as
   the fallback for engines that cannot do it.
+
+### 5.1 Multi-tier LOD (the scale ladder)
+
+The reduction primitives above compose into an explicit tier ladder whose
+governing rule is: **never ship or draw more primitives than the screen has
+pixels.** The tier is chosen per mark and re-chosen on zoom over the _visible
+window only_, hysteresis-guarded to avoid thrashing:
+
+1. **Direct** — raw columns, instanced draw. Exact. Budgeted by count _and_
+   fill-rate (§4).
+2. **Decimated** — M4 / min-max-per-pixel-column for lines/areas (keeps first,
+   last, min, max so spikes and inter-column segments survive). Recomputed for
+   the visible x-range only.
+3. **Aggregated tile pyramid** — for massive scatter/heatmaps, a data-space
+   pyramid of density tiles at power-of-two zoom levels (count/mean-color per
+   cell). Pan = tile reuse; zoom = adjacent level; only zooming below the finest
+   level re-bins, and only the visible window. Per-frame cost is O(visible tiles),
+   not O(points). Colormapping happens at composite time, so restyle never re-bins.
+4. **Out-of-core tiling** — for larger-than-RAM data, chunked columns paged by
+   viewport with pre-aggregated overview tiles; resident memory stays
+   screen-bounded, not data-bounded.
+
+This makes **cost scale with pixels, not rows** — the central bet validated by
+datashader, Falcon, imMens, and reflex `xy`. On Deephaven the pyramid/decimation
+ops run server-side; the tile machinery is shared with out-of-core tiling.
+
+### 5.2 Interaction latency model
+
+Budgets that keep interaction smooth while heavier work happens off the critical
+path:
+
+- **Pan/zoom** — same frame: a uniform (view-matrix) update only, never blocks
+  on recompute.
+- **Tier rebuild after zoom** — non-blocking **stale-while-revalidate**: keep
+  drawing the old tier transformed by the new view (right position, slightly
+  wrong resolution), swap when the worker/engine delivers.
+- **Re-bin on large data** — **progressive refinement**: bin a 1-in-k sample
+  first (coarse density appears immediately), refine over subsequent frames.
+- **Hover** — async GPU-pick readback, tolerating 1-frame staleness.
 
 ---
 
@@ -310,6 +362,33 @@ individual point (point-level diffs are supported but opt-in for small marks).
 Patches are **coalesced** within a frame and applied atomically so the renderer
 never shows a half-applied state. `key`/`order` channels drive stable
 enter/update/exit for animated transitions.
+
+### 7.1 Transfer cache — never send the same bytes twice
+
+On top of the patch channels sits a **content-addressed, generation-keyed cache**
+(adopted from reflex `xy`) so the wire carries only what the client provably
+lacks:
+
+- Every transferable unit (column chunk, pyramid tile, decimation buffer, filter
+  slab) has a stable ID: `(source, tier, tile|chunk, data_generation, filter_hash)`.
+  Entries are **immutable** — a changed tile is a _new_ ID, never an overwrite —
+  so any ID the client holds is valid forever and eviction is pure LRU under a
+  byte budget. There is no invalidation protocol to get wrong.
+- **Manifest handshake:** on a state change the producer sends the ID list the
+  new view needs (a few hundred bytes); the client replies with the subset it
+  lacks; only those payloads ship. One round-trip, zero redundant bytes, and a
+  reconnect (empty cache) needs no special path — it just lacks everything.
+- **Per-interaction cost becomes explicit:** pan within cached tiles = 0 bytes;
+  theme/style change = 0 bytes (client uniforms/LUT); filter toggle _back_ to a
+  cached state = 0 bytes; new filter = recomputed visible tiles only.
+
+### 7.2 Zone maps (chunk statistics)
+
+At ingest, every column chunk gets a one-pass stats block
+(`min, max, count, null_count, sum, sum_sq`, + dictionary cardinality). Nearly
+free, and it buys **O(chunks) autorange** instead of O(rows), viewport chunk
+pruning (Parquet-row-group-style), instant a11y summaries, and the domain for
+deep-zoom offset re-centering (§20) — all without scanning raw data.
 
 ---
 
@@ -527,18 +606,25 @@ inheritance and inference explicit:
 
 ## 13. Decision Log (resolved questions & conflicts)
 
-| #   | Question / conflict                                 | Decision                                                                                                                            |
-| --- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Grammar vs. trace as the core model                 | **Grammar core** (channels + geoms + stats + scales). Traces are a _compiled artifact_.                                             |
-| 2   | Deep vs. shallow inheritance; is nesting allowed?   | **Flat class registry**, linear `extends`, C3 linearization; **no nested class trees**. Explicit merge algebra (§3.8).              |
-| 3   | Server-side vs. client-side ops                     | **Capability- + cost-based planner** (§8); server-side default on Deephaven; fail loudly if impossible.                             |
-| 4   | WebGPU-only vs. fallback                            | **WebGPU primary + WebGL2 fallback + SVG export**, one scene-graph interface (§4).                                                  |
-| 5   | How much typing inference is "magic"                | **Deterministic arity table** (§3.3); inference writes the geom back into the compiled doc; high-level API may pin it.              |
-| 6   | Delta granularity                                   | **Column/row-range default**, point-level opt-in; two channels (model + data); frame-coalesced, atomic (§7).                        |
-| 7   | Layout language ("CSS-like" without CSS complexity) | **Single-pass constraint box model** with `fr`/`px`/`%`/`auto` + edge attachment + grid; boxes materialized in compiled doc (§3.5). |
-| 8   | Series vs. shapes as separate concepts              | **Unified marks** vocabulary; a series is a shape templated over data (§3.2).                                                       |
-| 9   | Backend feature-parity leakage (Plots.jl trap)      | **Capability flags** + early hard failure with diagnostics; never silent degradation (§8/§9).                                       |
-| 10  | Model versioning/migration                          | **Versioned schema** with forward migrations run by the resolver; documents declare `version`.                                      |
+| #   | Question / conflict                                 | Decision                                                                                                                                             |
+| --- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Grammar vs. trace as the core model                 | **Grammar core** (channels + geoms + stats + scales). Traces are a _compiled artifact_.                                                              |
+| 2   | Deep vs. shallow inheritance; is nesting allowed?   | **Flat class registry**, linear `extends`, C3 linearization; **no nested class trees**. Explicit merge algebra (§3.8).                               |
+| 3   | Server-side vs. client-side ops                     | **Capability- + cost-based planner** (§8); server-side default on Deephaven; fail loudly if impossible.                                              |
+| 4   | WebGPU-only vs. fallback                            | **WebGPU primary + WebGL2 fallback + SVG export**, one scene-graph interface (§4).                                                                   |
+| 5   | How much typing inference is "magic"                | **Deterministic arity table** (§3.3); inference writes the geom back into the compiled doc; high-level API may pin it.                               |
+| 6   | Delta granularity                                   | **Column/row-range default**, point-level opt-in; two channels (model + data); frame-coalesced, atomic (§7).                                         |
+| 7   | Layout language ("CSS-like" without CSS complexity) | **Single-pass constraint box model** with `fr`/`px`/`%`/`auto` + edge attachment + grid; boxes materialized in compiled doc (§3.5).                  |
+| 8   | Series vs. shapes as separate concepts              | **Unified marks** vocabulary; a series is a shape templated over data (§3.2).                                                                        |
+| 9   | Backend feature-parity leakage (Plots.jl trap)      | **Capability flags** + early hard failure with diagnostics; never silent degradation (§8/§9).                                                        |
+| 10  | Model versioning/migration                          | **Versioned schema** with forward migrations run by the resolver; documents declare `version`.                                                       |
+| 11  | Numeric precision on the GPU                        | **Offset-encoded f32** with f64/i64 canonical on CPU; per-trace/axis `offset+scale`; deep-zoom re-centering; ticks/hover never f32 (§20).            |
+| 12  | External CSS / Tailwind styling                     | **Three-surface model:** DOM chrome = plain CSS; marks = `--chart-*` custom-property token bridge; per-mark data-driven = spec-level (§18).          |
+| 13  | Filtering, selection & linked views                 | **Three-tier filter model** (indexed range / visible-window re-bin / Falcon summed-area cube) + per-row selection bitmask; Deephaven pushdown (§19). |
+| 14  | Wire efficiency                                     | **Content-addressed, generation+filter-keyed immutable cache** with manifest handshake — never send the same bytes twice (§7.1).                     |
+| 15  | Null / gap semantics                                | **Arrow validity bitmaps** end-to-end; NaN never reaches vertex buffers; null inside a line = gap (§20).                                             |
+| 16  | Interaction latency                                 | Pan/zoom = uniform-only same-frame; tier rebuild non-blocking via **stale-while-revalidate + progressive refinement**; async GPU picking (§5.2/§20). |
+| 17  | Big-data tier ladder                                | **Direct → decimated → data-space tile pyramid → out-of-core tiling**; tier chosen on count _and_ fill-rate; chunked buffers (§5.1).                 |
 
 ---
 
@@ -587,6 +673,20 @@ is expressible in the JSON model and reducible to columnar/GPU or engine ops.
   visual-regression testing.
 - Accessibility layer (keyboard nav, ARIA, generated text descriptions).
 - Deephaven `plot_by` and business-time calendars as native features.
+
+**Styling & robustness (adopted from reflex `xy`)**
+
+- External styling: DOM-chrome CSS/Tailwind + a `--chart-*` custom-property token
+  bridge for marks; live re-resolution on theme/dark-mode change (§18).
+- Offset-encoded f32 with f64/i64 canonical for exact time/finance/geo (§20).
+- Arrow validity bitmaps; NaN-safe vertex buffers; null-as-gap line semantics (§20).
+- Content-addressed transfer cache + manifest handshake; zone maps (§7.1/§7.2).
+- Multi-tier LOD tile pyramid + out-of-core tiling; fill-rate-aware tiering (§5.1).
+- Filtering, selection & linked brushing (Falcon summed-area cube) (§19).
+- Async GPU picking; stale-while-revalidate + progressive refinement latency (§5.2).
+- Determinism: CPU reference rasterizer as the CI oracle; per-backend perceptual
+  diffs; asserted LOD decisions (§20).
+- Dashboard scaling: WebGL/WebGPU context governor with LRU eviction (§20).
 
 **Deferred (not yet gate-passing; revisit)**
 
@@ -659,3 +759,153 @@ Condensed justification for the committed decisions, drawn from prior art:
   provenance/compile tooling.
 - **Constraint layout (CSS fl/grid):** authorable and mechanically solvable, with
   materialized boxes for inspection — the readability Plotly lacks.
+- **Pixel-bounded cost + native compute (reflex `xy`, datashader, Falcon, vaex):**
+  cost scaling with pixels not rows, offset-encoded precision, the tile pyramid,
+  the transfer cache, the CSS token bridge, and the filter/linked-view cube are
+  adopted directly (§5, §7.1, §18–§20). Where `xy` runs a native Rust core in the
+  Python process, we instead lean on Deephaven's engine as the native compute
+  tier (§21).
+
+---
+
+## 18. External Styling & Theming
+
+Goal: let authors style charts with **plain CSS / Tailwind / design tokens** as
+far as physically possible, without giving up GPU-scale rendering. The honest
+constraint (shared by every GPU renderer — deck.gl, ECharts-GL, reflex `xy`) is
+that **data marks are pixels in a canvas, not DOM nodes**, so a selector like
+`.point { fill: red }` has nothing to match. The design therefore splits styling
+into three surfaces:
+
+**(a) Chrome — genuinely CSS-native.** Axis labels, titles, legend, tooltips,
+hover readouts, and the container are real DOM/SVG. Fonts, color, spacing,
+borders, focus states, Tailwind utility classes, and `@media` queries all apply
+directly, with full cascade and inheritance. This covers most of "make the chart
+match my site" — typography and chrome.
+
+**(b) Marks — a CSS custom-property token bridge.** The renderer reads `--chart-*`
+custom properties off its container at mount and maps them to GPU uniforms/LUTs
+(clear color, grid/axis color, default series palette, colormap). Because the
+_variables_ cascade even though the pixels don't, per-container theming, brand
+overrides, and `@media (prefers-color-scheme: dark)` behave exactly as a CSS
+author expects. A documented token vocabulary (`--chart-bg`, `--chart-grid`,
+`--chart-axis`, `--chart-text`, `--chart-series-N`, `--chart-colormap`, tooltip/
+selection/crosshair tokens…) is the contract. Custom-property colors that a
+headless export can't resolve (`oklch()`, `color-mix()`, `var()`) are normalized
+to fixed channels at the boundary so browser and server render identically.
+Live re-resolution watches `matchMedia` + a `MutationObserver` on the container;
+because of the retained scene graph, a theme change is a **uniform/LUT update, not
+a data re-upload** — dark-mode toggling stays at frame rate even on huge charts,
+and costs **0 wire bytes** (§7.1).
+
+**(c) Per-mark, data-driven styling — spec-level, not CSS.** Coloring by a data
+column or styling one selected point is not reachable by CSS and never will be
+(there is no node). It goes through encoding channels (`color=field`,
+`size=field`) and the selection bitmask (§19), resolved on the GPU. This is the
+same property that makes the engine scale.
+
+**Deephaven fit:** the token bridge should bind to the existing web-client-ui
+theme variables so charts inherit the app theme automatically; `fig.theme(...)`
+in Python gives notebook users the same control without touching CSS. For
+kernel-side export to match on-screen CSS, the client snapshots its resolved
+tokens back over the comm channel so the server holds the effective theme.
+
+---
+
+## 19. Filtering, Selection & Linked Views
+
+Filtering is not an edge case in analytics — it is the main event, and a static
+aggregate (pyramid/tile) is **stale under any dynamic predicate**. Selection and
+cross-filtering therefore get a first-class, three-tier model mirroring the LOD
+ladder (adopted from reflex `xy` / Falcon / Mosaic):
+
+- **Tier A — indexed range predicates:** time windows, axis-linked ranges,
+  numeric between. Resolved by zone-map (§7.2) tile pruning + boundary re-bin.
+  O(boundary) — the common pan/zoom-linked case.
+- **Tier B — arbitrary predicates:** string contains, computed expressions,
+  multi-column conditions. Re-bin the **visible window only** (server-side on
+  Deephaven), under stale-while-revalidate + progressive refinement.
+- **Tier C — linked brushing across views:** a **summed-area (cumulative-sum)
+  index** keyed on the active brushing dimension at bin resolution makes any
+  brush a difference of cumulative sums — O(1) per bin, O(bins) per passive view,
+  independent of row count (Falcon sustains ~50 fps across many linked views at
+  billions of rows). The index is sized ∝ bins not rows, rebuilt when the active
+  view changes, prefetched on idle.
+
+**Selection is model state:** a per-row selection bitmask (1 bit/row) drives
+styled selected/unselected rendering at every tier — aggregated tiers carry a
+second "selected-count" channel so a brush lights up density, not just direct
+marks. On Deephaven, selections push down as engine filters (crossfilter), and
+the legend toggle is just the first shipped predicate. Every filter application
+logs which tier served it — no silent full rescans.
+
+---
+
+## 20. Precision, Nulls, Latency & Determinism (robustness)
+
+The correctness details that separate a demo from a production engine, grouped:
+
+- **Numeric precision.** f64/i64 canonical on the CPU; GPU gets offset-encoded
+  f32 via per-trace/axis `offset+scale` (multiple traces at wildly different
+  magnitudes each get their own offset). Deep zoom re-centers the offset from
+  zone maps (§7.2) before f32 granularity shows; log/symlog axes pin offset 0.
+  Axis ticks, tick labels, and hover readouts are computed in f64/i64 and never
+  routed through any float path. Time is i64 end-to-end with calendar-aware ticks.
+- **Nulls, NaN, gaps.** Arrow validity bitmaps are the single source of null
+  truth (1 bit/value). NaN/invalid never reaches vertex buffers (an f32 NaN
+  silently kills primitives and differs by driver — a determinism hole).
+  A null inside a line = gap (segmented at ingest); decimation treats gaps as
+  hard edges; aggregations skip nulls and expose `count_valid` vs `count`.
+- **Latency & picking.** See §5.2 — uniform-only pan/zoom, stale-while-revalidate
+  tier swaps, progressive refinement, async GPU picking with exact source-row
+  readback at direct/decimated tiers and honest bin-summary + drill-to-top-k at
+  aggregated tiers.
+- **Determinism & testing.** A CPU (software) rasterizer is the bit-deterministic
+  **reference oracle**; every backend (WebGPU/WebGL2/native) is perceptual-diffed
+  against it, and aggregate/decimated buffers are asserted bit-identical across
+  backends. LOD decisions are part of the tested contract — given
+  `(data, viewport)`, the chosen tier and reduced output are deterministic and
+  asserted, so a visual change bisects cleanly to layout, LOD, or raster.
+- **Dashboard scaling.** Browsers cap live GPU contexts (~16 in Chrome); a
+  context governor keeps a page under budget with LRU eviction of off-screen
+  charts and rebuild-on-scroll, so a 30-chart dashboard doesn't blank its
+  earliest charts. All GPU state is rebuildable from the scene graph + canonical
+  store, so device/context loss is a reupload, not a crash.
+
+---
+
+## 21. On the Native / Rust Core (does the reflex `xy` approach apply?)
+
+reflex `xy` puts a native Rust core (C-ABI `cdylib`, loaded via `ctypes`) _inside
+the Python process_ doing all heavy work — decimation, binning, pyramids,
+filtering, headless export — with a thin JS/WebGL2 client. Its concrete wins:
+
+- **No WASM caps** (4 GB linear-memory ceiling, no shrink, no atomics), real
+  threads, SIMD, and `mmap` for out-of-core.
+- **One `py3-none-<platform>` wheel per platform** (a plain C ABI sidesteps the
+  CPython-version × PyO3/abi3 matrix).
+- **Headless export** (PNG/SVG/PDF) from the _same_ core with no browser, which
+  doubles as the deterministic CI reference rasterizer (§20).
+- **Memory-safe parsing** of untrusted Arrow IPC at server/multi-user boundaries.
+
+**How much of that we need is different, because Deephaven already _is_ the native
+compute tier.** The engine does ticking aggregation, binning, and downsampling
+server-side in the JVM; that is precisely the role `xy` hands to Rust. So the
+primary motivation ("get heavy compute out of the browser and off the main
+thread") is already satisfied by the query planner (§8) pushing ops to Deephaven.
+Where a native/Rust component could still earn its place:
+
+- **A shared, engine-agnostic reduction kernel** (M4/min-max, bin2d, tile-pyramid
+  build, summed-area index) for the _client-side / non-Deephaven_ fallback path,
+  and for deterministic headless export. This is the strongest case — it keeps
+  the abstraction honest (§9) and gives a reference implementation.
+- **A WASM build of that same kernel** for the browser fallback tier and static
+  HTML export, so a chart still reduces when no engine round-trip is available.
+- **Not** a Rust core in the Python process for the Deephaven happy path — that
+  would duplicate the engine. Optimize for Deephaven; keep the kernel as a
+  portable fallback, not the primary compute.
+
+Net: adopt `xy`'s _architecture ideas_ (pixel-bounded cost, tiers, precision,
+transfer cache, token-bridge styling) wholesale; adopt its _Rust-in-Python_
+deployment only as an optional shared reduction/export kernel behind the engine
+adapter, since Deephaven fills the native-compute role for the main path.

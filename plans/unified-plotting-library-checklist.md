@@ -392,6 +392,156 @@ parentheses (e.g. §3.8) reference the design plan.
 
 ---
 
+## Phase 10 — Precision, Nulls & Determinism (robustness)
+
+- [ ] **10.1 Offset-encoded f32 precision.** Keep f64/i64 canonical on the CPU;
+      upload per-trace/axis `offset+scale` relative f32; fold offset into the view
+      transform in f64. (plan §4, §20)
+      **Done when:** a 1-second span inside a 10-year ms-timestamp series renders
+      without visible quantization, and a heap check confirms a 4-byte GPU footprint.
+
+- [ ] **10.2 Deep-zoom offset re-centering.** Re-center the offset from zone maps
+      before f32 granularity shows; pin offset 0 on log/symlog axes; hysteresis at
+      the threshold. **Depends on:** 10.1, 10.5. (plan §20)
+      **Done when:** deep zoom into a large-magnitude domain stays sub-pixel and
+      zooming back out recovers the original point spread exactly.
+
+- [ ] **10.3 Ticks/hover in f64/i64.** Compute tick positions, labels, and hover
+      readouts CPU-side from canonical columns, never through f32. (plan §20)
+      **Done when:** tick and hover values are exact at a zoom where geometry is
+      f32-quantized, asserted by test.
+
+- [ ] **10.4 Validity bitmaps & null-as-gap.** Carry Arrow validity bitmaps end to
+      end; keep NaN out of vertex buffers; segment lines at nulls; skip nulls in
+      aggregations with `count_valid` vs `count`. (plan §20)
+      **Done when:** a series with interior nulls renders gaps (no invented
+      segments), no NaN reaches a buffer, and aggregate null-handling matches a
+      reference.
+
+- [ ] **10.5 Zone maps (chunk statistics).** Compute per-chunk
+      `min/max/count/null_count/sum/sum_sq` at ingest. (plan §7.2)
+      **Done when:** autorange is O(chunks) (verified by instrumentation) and
+      viewport chunk pruning skips non-intersecting chunks.
+
+- [ ] **10.6 CPU reference rasterizer + perceptual-diff CI.** Ship a deterministic
+      software rasterizer as the oracle; perceptual-diff every backend against it;
+      assert reduced buffers bit-identical across backends. (plan §20)
+      **Depends on:** 3.9.
+      **Done when:** WebGPU and WebGL2 outputs pass perceptual diff vs the CPU
+      reference, and aggregate/decimated buffers are asserted bit-identical.
+
+- [ ] **10.7 GPU/WebGL context governor.** Keep a page under a live-context budget
+      with LRU eviction of off-screen charts and rebuild-on-scroll; recover from
+      device/context loss by rebuilding from the scene graph. (plan §20)
+      **Done when:** a 30-chart dashboard keeps all visible charts live and no
+      chart permanently blanks; a simulated context loss recovers via reupload.
+
+---
+
+## Phase 11 — Multi-tier LOD & Latency
+
+- [ ] **11.1 Data-space tile pyramid (aggregated tier).** Build power-of-two
+      density tiles in data coordinates; compose visible tiles per frame; re-bin
+      only below the finest level and only the visible window. **Depends on:** 4.3.
+      (plan §5.1)
+      **Done when:** pan is tile reuse (0 re-bin) and per-frame cost is O(visible
+      tiles), verified by instrumentation; bin counts match a reference.
+
+- [ ] **11.2 Fill-rate-aware tier selection & buffer chunking.** Select tiers on
+      count _and_ `mark_pixel_area × overdraw`; chunk large vertex buffers into
+      multi-buffer draws. (plan §4, §5.1)
+      **Done when:** a dense large-marker scatter trips aggregation below the
+      vertex-count ceiling, and a >1 GB dataset allocates without a single
+      oversized buffer.
+
+- [ ] **11.3 Out-of-core tiling.** Page chunked columns by viewport with
+      pre-aggregated overview tiles; keep resident memory screen-bounded.
+      **Depends on:** 11.1. (plan §5.1)
+      **Done when:** a larger-than-RAM fixture renders interactively with bounded
+      resident memory (asserted by a memory ceiling in the benchmark).
+
+- [ ] **11.4 Latency model: SWR + progressive refinement.** Keep drawing the old
+      tier under the new view during rebuild; bin a sample first then refine.
+      (plan §5.2)
+      **Done when:** pan/zoom never blocks on recompute (same-frame uniform
+      update) and a coarse density appears within one frame of a large re-bin.
+
+- [ ] **11.5 Async GPU picking.** Render integer IDs to an offscreen target with
+      async readback; exact row at direct/decimated tiers, bin-summary + drill at
+      aggregated tiers. (plan §20, §5.2)
+      **Done when:** hover resolves the correct target within ≤2 frames regardless
+      of point count, and aggregated-tier hover reports a bin summary + top-k drill.
+
+---
+
+## Phase 12 — Transfer Cache & Filtering
+
+- [ ] **12.1 Content-addressed, generation-keyed cache.** Give every transferable
+      unit an immutable ID `(source, tier, tile|chunk, data_generation,
+    filter_hash)`; LRU-evict under a byte budget. (plan §7.1)
+      **Done when:** a changed tile produces a new ID (never an overwrite) and a
+      re-request of a held ID transfers 0 bytes.
+
+- [ ] **12.2 Manifest handshake.** On state change, send the needed ID list; the
+      client requests only what it lacks; ship only those. **Depends on:** 12.1.
+      (plan §7.1)
+      **Done when:** pan within cached tiles transfers 0 bytes, and a fresh client
+      (empty cache) recovers via the same manifest path with no special case.
+
+- [ ] **12.3 Filter Tier A — indexed range predicates.** Resolve range filters by
+      zone-map tile pruning + boundary re-bin. **Depends on:** 10.5. (plan §19)
+      **Done when:** a range filter recomputes only boundary tiles (verified) and
+      matches a full-recompute reference.
+
+- [ ] **12.4 Filter Tier B — visible-window re-bin.** Serve arbitrary predicates
+      by re-binning the visible window server-side under SWR. **Depends on:** 11.4.
+      (plan §19)
+      **Done when:** an arbitrary-predicate filter updates the visible view
+      correctly without a full-dataset scan.
+
+- [ ] **12.5 Selection bitmask.** Per-row 1-bit selection driving styled
+      selected/unselected rendering at every tier; aggregated tiers carry a
+      selected-count channel. (plan §19)
+      **Done when:** a selection dims unselected direct marks and lights up
+      selected density on an aggregated tier.
+
+- [ ] **12.6 Filter Tier C — Falcon summed-area cube (linked brushing).** Build a
+      cumulative-sum index on the active dimension; resolve brushes as cumsum
+      differences across passive views; push down to Deephaven. **Depends on:**
+      12.5, 5.5. (plan §19)
+      **Done when:** a brush updates ≥5 linked views at interactive frame rates on
+      a large fixture, index size scales with bins not rows, and pushdown filters
+      the engine.
+
+---
+
+## Phase 13 — External Styling & Theming
+
+- [ ] **13.1 CSS-native chrome.** Render axes/labels/legend/tooltips/container as
+      DOM/SVG styleable by plain CSS/Tailwind with full cascade. (plan §18)
+      **Done when:** a Tailwind/utility-class stylesheet restyles all chrome and a
+      `@media (prefers-color-scheme)` rule flips chrome theming.
+
+- [ ] **13.2 `--chart-*` custom-property token bridge.** Read documented tokens at
+      mount, map to GPU uniforms/LUTs; normalize export-unsafe colors at the
+      boundary. (plan §18)
+      **Done when:** setting `--chart-*` variables (incl. via a cascading parent)
+      restyles marks, and a probe resolves `oklch()`/`color-mix()` to fixed channels.
+
+- [ ] **13.3 Live re-resolution (0-byte theme change).** Watch `matchMedia` +
+      `MutationObserver`; apply theme changes as uniform/LUT updates, not data
+      re-uploads. **Depends on:** 13.2, 7.1. (plan §18)
+      **Done when:** a dark-mode toggle repaints via uniforms only (no buffer
+      re-upload, 0 wire bytes) at frame rate on a large chart.
+
+- [ ] **13.4 web-client-ui theme binding + Python parity.** Bind tokens to the app
+      theme variables; expose `fig.theme(...)`; snapshot resolved tokens to the
+      server for export parity. (plan §18)
+      **Done when:** a chart inherits the app theme with no per-chart config, and a
+      kernel-side export matches the on-screen CSS theme.
+
+---
+
 ## Cross-cutting definition of done
 
 Every task above must also satisfy:
