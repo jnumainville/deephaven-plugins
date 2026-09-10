@@ -21,6 +21,9 @@ const log = Log.module('TradingViewChartModel');
 
 const DOWNSAMPLE_THRESHOLD = 1000;
 
+/** Bucket count used when the chart has no usable pixel width yet. */
+const DEFAULT_DOWNSAMPLE_WIDTH = 1000;
+
 /**
  * Manages the data flow between Deephaven tables and the chart renderer.
  * Uses table.subscribe() and ChartData for efficient delta-based updates,
@@ -599,7 +602,14 @@ class TradingViewChartModel {
       ];
     }
 
-    const targetWidth = width ?? 1000;
+    // `?? ` alone is not enough: a chart that is hidden (an inactive
+    // deephaven.ui tab, a collapsed panel) or not yet laid out reports a
+    // time-scale width of 0, and runChartDownsample asserts pxCount > 0
+    // server-side, which surfaces as an Internal Error. Fall back to the
+    // default bucket count until a real width arrives; the resize handler
+    // re-resamples once the chart is actually visible.
+    const targetWidth =
+      width != null && width > 0 ? Math.round(width) : DEFAULT_DOWNSAMPLE_WIDTH;
 
     this.dbg(
       `downsampleTable tid=${tableId} range=${
@@ -779,6 +789,15 @@ class TradingViewChartModel {
 
   /** Unified resample router: dispatches to downsample and auto-bin paths. */
   performResample(range: [number, number] | null, width: number): void {
+    // A hidden chart (inactive panel tab, collapsed pane) reports width 0.
+    // Resampling then would ship a result computed for a bucket count the
+    // chart never had — a too-sparse line, or a viewport that snaps when the
+    // tab is finally shown. Skip: becoming visible changes the width, and
+    // the size-change handler resamples properly at that point.
+    if (!(width > 0)) {
+      this.dbg(`performResample skipped: width=${width}`);
+      return;
+    }
     if (this.isDownsampled()) {
       this.performDownsample(range, width).catch(err => {
         log.warn('performDownsample failed', err);

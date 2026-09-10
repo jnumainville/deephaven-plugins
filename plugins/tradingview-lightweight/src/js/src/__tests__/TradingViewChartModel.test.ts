@@ -498,10 +498,59 @@ describe('TradingViewChartModel auto-bin', () => {
       model.performResample([0, 100], 1024);
       expect(widget.sendMessage).not.toHaveBeenCalled();
     });
+
+    it('skips resampling entirely when the chart has no width', async () => {
+      // Hidden charts (inactive panel tab / collapsed pane) report width 0.
+      // Resampling then produces a result for a bucket count the chart never
+      // had, which shows up as a too-sparse line or a snapping viewport once
+      // the tab is opened. The size-change handler resamples when it appears.
+      const { model, widget } = await initModelWithAutoBin(true);
+      model.performResample([0, 100], 0);
+      expect(widget.sendMessage).not.toHaveBeenCalled();
+    });
   });
 });
 
 describe('TradingViewChartModel partition downsampling', () => {
+  it('never requests a non-positive downsample width', async () => {
+    // Regression: a hidden chart (inactive deephaven.ui tab, collapsed
+    // panel) reports timeScale.width() === 0. That used to reach
+    // runChartDownsample, which asserts pxCount > 0 server-side and logs an
+    // Internal Error / AssertionFailure.
+    const dh = makeMockDh();
+    const widget = makeMockWidget();
+    const model = new TradingViewChartModel(dh, widget as never);
+
+    const partitionSourceTable = new MockTable(5_000);
+    const partitionedTable = makeMockPartitionedTable(
+      new Map([['aaa', partitionSourceTable]])
+    );
+    const runDownsample = runDownsampleMock(dh);
+    runDownsample.mockResolvedValue(new MockTable(250));
+
+    await model.init(
+      [
+        { fetch: jest.fn().mockResolvedValue(new MockTable(10_000_000)) },
+        { fetch: jest.fn().mockResolvedValue(partitionedTable) },
+      ] as never,
+      JSON.stringify({
+        type: 'NEW_FIGURE',
+        figure: makePartitionFigure(),
+        revision: 1,
+        new_references: [0, 1],
+        removed_references: [],
+      })
+    );
+
+    runDownsample.mockClear();
+    await model.performDownsample([0, 100], 0);
+
+    expect(runDownsample).toHaveBeenCalled();
+    runDownsample.mock.calls.forEach(call => {
+      expect(call[3]).toBeGreaterThan(0);
+    });
+  });
+
   it('downsamples large partition constituents without fetching the raw source table', async () => {
     const dh = makeMockDh();
     const widget = makeMockWidget();

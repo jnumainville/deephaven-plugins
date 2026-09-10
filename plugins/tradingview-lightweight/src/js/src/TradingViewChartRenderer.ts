@@ -357,10 +357,25 @@ class TradingViewChartRenderer {
   /** Ids of series rendered by ContinuousBarsSeries (need `ts` stamping). */
   private continuousSeriesIds: Set<string> = new Set();
 
+  /**
+   * Ascending data items per series, captured as we set the data.
+   *
+   * Markers are anchored against these (see setSeriesMarkers). LWC derives a
+   * marker's vertical position from the series row at its index, and returns
+   * without setting `y` when the row shape isn't recognized — which parks
+   * markers at the top of the pane on custom (continuous) series. Supplying
+   * an explicit `price` short-circuits that lookup entirely.
+   */
+  private seriesDataItems: Map<string, Array<Record<string, unknown>>> =
+    new Map();
+
   /** Active tracking tooltip, when enabled via chartOptions.tooltip.visible. */
   private tooltip: TradingViewTooltip | null = null;
 
   private markersMap: Map<string, ISeriesMarkersPluginApi<Time>> = new Map();
+
+  /** Last markers applied per series, so new data can re-anchor them. */
+  private lastMarkers: Map<string, TvlMarkerData[]> = new Map();
 
   /** Dynamic price lines that track a column's last-row value. */
   private dynamicPriceLines: Map<
@@ -691,6 +706,7 @@ class TradingViewChartRenderer {
     this.seriesColors.clear();
     this.continuousOhlcColors.clear();
     this.continuousSeriesIds.clear();
+    this.seriesDataItems.clear();
     this.dynamicPriceLines.clear();
 
     // Create scaffold FIRST so it occupies base time positions
@@ -857,34 +873,48 @@ class TradingViewChartRenderer {
     // Continuous (end-to-end) rendering is the default for the ordinal bar
     // types: bodies span their full time bin via a custom series instead of
     // the built-in fixed pixel width. Opt out with continuous=False.
-    if (config.continuous !== false && isContinuousBarType(config.type)) {
-      this.continuousSeriesIds.add(config.id);
-      if (config.type !== 'Histogram') {
-        const opts = config.options;
-        this.continuousOhlcColors.set(config.id, {
-          up: (opts.upColor as string) ?? '#26a69a',
-          down: (opts.downColor as string) ?? '#ef5350',
-        });
+    try {
+      if (config.continuous !== false && isContinuousBarType(config.type)) {
+        this.continuousSeriesIds.add(config.id);
+        if (config.type !== 'Histogram') {
+          const opts = config.options;
+          this.continuousOhlcColors.set(config.id, {
+            up: (opts.upColor as string) ?? '#26a69a',
+            down: (opts.downColor as string) ?? '#ef5350',
+          });
+        }
+        return this.chart.addCustomSeries(
+          new ContinuousBarsSeries(config.type),
+          config.options as never,
+          config.paneIndex
+        ) as unknown as ISeriesApi<SeriesType>;
       }
-      return this.chart.addCustomSeries(
-        new ContinuousBarsSeries(config.type),
-        config.options as never,
-        config.paneIndex
-      ) as unknown as ISeriesApi<SeriesType>;
-    }
 
-    const definition = SERIES_DEFINITIONS[config.type];
-    if (definition == null) {
-      log.warn('Unknown series type:', config.type);
+      const definition = SERIES_DEFINITIONS[config.type];
+      if (definition == null) {
+        log.warn('Unknown series type:', config.type);
+        return null;
+      }
+
+      const options = config.options as SeriesPartialOptionsMap[SeriesType];
+      return this.chart.addSeries(
+        definition as Parameters<typeof this.chart.addSeries>[0],
+        options,
+        config.paneIndex
+      );
+    } catch (e) {
+      log.error(
+        'Failed to create series',
+        JSON.stringify({
+          id: config.id,
+          type: config.type,
+          pane: config.paneIndex,
+          continuous: config.continuous,
+        }),
+        e
+      );
       return null;
     }
-
-    const options = config.options as SeriesPartialOptionsMap[SeriesType];
-    return this.chart.addSeries(
-      definition as Parameters<typeof this.chart.addSeries>[0],
-      options,
-      config.paneIndex
-    );
   }
 
   /**
@@ -913,20 +943,70 @@ class TradingViewChartRenderer {
   }
 
   /**
+   * Time of the last point currently rendered for a series, or undefined
+   * when it has no data. Callers use this to decide whether an incoming
+   * batch can go through the incremental `update()` path.
+   */
+  getLastSeriesTime(seriesId: string): number | undefined {
+    const items = this.seriesDataItems.get(seriesId);
+    if (items == null || items.length === 0) return undefined;
+    const t = items[items.length - 1].time;
+    return typeof t === 'number' ? t : undefined;
+  }
+
+  /**
    * Replace all data for a specific series. Use only for initial load
    * or full reconfiguration — NOT for ticking updates.
    */
   setSeriesData(seriesId: string, data: unknown[]): void {
     const series = this.seriesMap.get(seriesId);
     if (!series) {
-      log.warn('Series not found:', seriesId);
+      // Data can arrive before the figure is configured; the figure update
+      // replays everything once the series exist.
+      log.debug2('setSeriesData before series exists:', seriesId);
       return;
     }
     data.forEach(point => this.injectOhlcItemColors(seriesId, point));
     if (this.continuousSeriesIds.has(seriesId)) {
       stampContinuousBarTimes(data);
     }
-    series.setData(data as Parameters<typeof series.setData>[0]);
+    const sorted = TradingViewChartRenderer.sortByTime(data);
+    this.seriesDataItems.set(
+      seriesId,
+      sorted.filter(
+        (d): d is Record<string, unknown> =>
+          typeof (d as { time?: unknown })?.time === 'number'
+      )
+    );
+    series.setData(sorted as Parameters<typeof series.setData>[0]);
+
+    // Markers anchor to a bar, so any applied while this series was empty (a
+    // reset swaps data in table by table) are parked at the top of the pane.
+    // Re-apply them now, in the same frame, so they never paint unanchored.
+    const pending = this.lastMarkers.get(seriesId);
+    if (pending != null) this.setSeriesMarkers(seriesId, pending);
+  }
+
+  /**
+   * LWC binary-searches its plot rows by index, so unsorted input makes it
+   * fail to find a row it just enumerated and throw 'Value is null' from the
+   * bar colorer. Production builds drop the ascending-order assertion that
+   * would otherwise report this, and Deephaven snapshots (notably downsample
+   * swaps) are not guaranteed to arrive in time order.
+   */
+  private static sortByTime(data: unknown[]): unknown[] {
+    const timeOf = (d: unknown): number =>
+      TradingViewChartRenderer.markerTimeToNumber(
+        (d as { time?: Time })?.time as Time
+      ) ?? Number.NEGATIVE_INFINITY;
+    let ascending = true;
+    for (let i = 1; i < data.length; i += 1) {
+      if (timeOf(data[i]) < timeOf(data[i - 1])) {
+        ascending = false;
+        break;
+      }
+    }
+    return ascending ? data : [...data].sort((a, b) => timeOf(a) - timeOf(b));
   }
 
   /**
@@ -937,12 +1017,24 @@ class TradingViewChartRenderer {
   updateSeriesPoint(seriesId: string, point: unknown): void {
     const series = this.seriesMap.get(seriesId);
     if (!series) {
-      log.warn('Series not found for update:', seriesId);
+      log.debug2('updateSeriesPoint before series exists:', seriesId);
       return;
     }
     this.injectOhlcItemColors(seriesId, point);
     if (this.continuousSeriesIds.has(seriesId)) {
       stampContinuousBarTimes([point]);
+    }
+    const t = (point as { time?: unknown }).time;
+    if (typeof t === 'number') {
+      const items = this.seriesDataItems.get(seriesId);
+      const item = point as Record<string, unknown>;
+      if (items == null) {
+        this.seriesDataItems.set(seriesId, [item]);
+      } else {
+        const last = items[items.length - 1];
+        if (last != null && last.time === t) items[items.length - 1] = item;
+        else items.push(item);
+      }
     }
     series.update(point as Parameters<typeof series.update>[0]);
   }
@@ -970,23 +1062,118 @@ class TradingViewChartRenderer {
     return this.textColor;
   }
 
+  /**
+   * Best-effort conversion of a marker time to epoch seconds. Markers accept
+   * a number, a `YYYY-MM-DD` string, or a `{year, month, day}` business day;
+   * series data times are always numbers.
+   */
+  private static markerTimeToNumber(time: Time): number | null {
+    if (typeof time === 'number') return time;
+    if (typeof time === 'string') {
+      const ms = Date.parse(
+        /^\d{4}-\d{2}-\d{2}$/.test(time) ? `${time}T00:00:00Z` : time
+      );
+      return Number.isNaN(ms) ? null : ms / 1000;
+    }
+    const bd = time as { year?: number; month?: number; day?: number };
+    if (bd?.year != null && bd.month != null && bd.day != null) {
+      return Date.UTC(bd.year, bd.month - 1, bd.day) / 1000;
+    }
+    return null;
+  }
+
+  /**
+   * Snap a marker time to the nearest real data point on the series.
+   *
+   * On a continuous (scaffolded) chart most time-scale indices are
+   * whitespace slots. LWC re-anchors markers through `dataByIndex`, which
+   * returns null for whitespace, so a marker whose time lands on a
+   * scaffold slot jumps to a neighboring bar and snaps back on the next
+   * update — visible as markers hopping while data ticks in and the
+   * scaffold is rebuilt. Anchoring to an actual data time keeps them put.
+   * Date-string marker times need this too: midnight essentially never
+   * coincides with the bar's real timestamp.
+   */
+  private static snapMarkerTime(
+    time: Time,
+    dataTimes: readonly number[]
+  ): Time {
+    if (dataTimes.length === 0) return time;
+    const target = TradingViewChartRenderer.markerTimeToNumber(time);
+    if (target == null) return time;
+    // dataTimes is ascending (series data is time-ordered).
+    let lo = 0;
+    let hi = dataTimes.length - 1;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (dataTimes[mid] < target) lo = mid + 1;
+      else hi = mid;
+    }
+    const after = dataTimes[lo];
+    const before = lo > 0 ? dataTimes[lo - 1] : after;
+    return (
+      Math.abs(after - target) < Math.abs(target - before) ? after : before
+    ) as Time;
+  }
+
+  /**
+   * Price a marker should anchor to, given the bar it sits on. Mirrors LWC's
+   * own rule (high for above, low for below, close/value otherwise).
+   */
+  private static markerPrice(
+    item: Record<string, unknown> | undefined,
+    position: TvlMarkerData['position']
+  ): number | undefined {
+    if (item == null) return undefined;
+    const num = (v: unknown): number | undefined =>
+      typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+    if (position === 'aboveBar' || position === 'atPriceTop') {
+      return num(item.high) ?? num(item.value) ?? num(item.close);
+    }
+    if (position === 'belowBar' || position === 'atPriceBottom') {
+      return num(item.low) ?? num(item.value) ?? num(item.close);
+    }
+    return num(item.close) ?? num(item.value);
+  }
+
   setSeriesMarkers(seriesId: string, markers: TvlMarkerData[]): void {
     const series = this.seriesMap.get(seriesId);
     if (!series) return;
+    this.lastMarkers.set(seriesId, markers);
+
+    // Snap onto real data times. A `YYYY-MM-DD` marker time resolves to UTC
+    // midnight, which never equals a bar's timestamp, so LWC cannot anchor
+    // it and parks the marker at the chart edge; on continuous series a raw
+    // time also tends to land on a whitespace slot, where re-anchoring
+    // through dataByIndex returns null and the marker jumps.
+    const items = this.seriesDataItems.get(seriesId) ?? [];
+    const dataTimes = items.map(d => d.time as number);
 
     const chartMarkers: SeriesMarker<Time>[] = markers.map(m => {
       const raw = this.resolveMarkerColor(m);
+      const time = TradingViewChartRenderer.snapMarkerTime(
+        m.time as Time,
+        dataTimes
+      );
+      // Explicit price: LWC otherwise infers it from the series row and
+      // silently leaves the marker unpositioned when the row shape isn't one
+      // it recognizes (the custom-series case).
+      const price =
+        m.price ??
+        TradingViewChartRenderer.markerPrice(
+          items[dataTimes.indexOf(time as number)],
+          m.position
+        );
       return {
-        time: m.time as Time,
+        time,
         position: m.position,
         shape: m.shape,
         color: resolveColor(raw) ?? raw,
         text: m.text,
         size: m.size,
-        ...(m.price != null ? { price: m.price } : {}),
+        ...(price != null ? { price } : {}),
       };
     }) as SeriesMarker<Time>[];
-
     // Use createSeriesMarkers API for v5
     let markerPlugin = this.markersMap.get(seriesId);
     if (!markerPlugin) {
@@ -995,6 +1182,17 @@ class TradingViewChartRenderer {
     } else {
       markerPlugin.setMarkers(chartMarkers);
     }
+  }
+
+  /**
+   * Re-map every series' markers onto the current time-scale indices.
+   * LWC caches a logical index per marker and resolves it with an exact
+   * dataByIndex match, so anything that shifts indices must trigger this.
+   */
+  refreshMarkers(): void {
+    this.lastMarkers.forEach((markers, seriesId) => {
+      this.setSeriesMarkers(seriesId, markers);
+    });
   }
 
   /**

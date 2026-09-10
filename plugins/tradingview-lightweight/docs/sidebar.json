@@ -10,6 +10,10 @@
         "path": "README.md"
       },
       {
+        "label": "Gallery",
+        "path": "gallery.md"
+      },
+      {
         "label": "Chart Types",
         "collapsible": false,
         "items": [

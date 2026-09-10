@@ -199,6 +199,44 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
   const suppressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /**
+   * The visible range our own fitContent / setVisibleRange produced. LWC
+   * delivers range-change events asynchronously, so matching against the
+   * range we just applied is the only timing-independent way to tell our
+   * changes from the user's — without it a programmatic fit reads as a zoom,
+   * flips userInteracted, and saves the full extent as the range to restore,
+   * undoing the real zoom.
+   */
+  const programmaticRangeRef = useRef<{ from: number; to: number } | null>(
+    null
+  );
+  /** Range the last downsample was requested for; gestures compare to it. */
+  const baselineRef = useRef<{ from: number; to: number } | null>(null);
+  /** True while handleDataUpdate is writing data and moving the viewport. */
+  const applyingDataRef = useRef(false);
+  const markProgrammaticViewport = useCallback(
+    (ts?: { getVisibleRange: () => { from: unknown; to: unknown } | null }) => {
+      try {
+        const vr = ts?.getVisibleRange();
+        programmaticRangeRef.current =
+          vr != null ? { from: Number(vr.from), to: Number(vr.to) } : null;
+        // Seed the gesture baseline, but only once: on a slow first load the
+        // settle timer fires before there is a range to sample. Re-seeding on
+        // every update would erase a gesture whose debounce has not fired yet,
+        // leaving the chart on stale downsampled data.
+        if (
+          baselineRef.current == null &&
+          programmaticRangeRef.current != null
+        ) {
+          baselineRef.current = programmaticRangeRef.current;
+        }
+      } catch {
+        programmaticRangeRef.current = null;
+      }
+    },
+    []
+  );
+
+  /**
    * Table ids that have had a price-axis width flush (see handleDataUpdate).
    * Lets the flush also cover a table whose FIRST rows arrive as a plain
    * append (e.g. a table_publisher feed), without paying a full update on
@@ -670,204 +708,256 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
 
       const ct = renderer.getChartType();
       const chart = renderer.getChart();
-      let dragRange: { from: number; to: number } | null = null;
-      if (draggingRef.current) {
-        try {
-          const vr = chart.timeScale().getVisibleRange();
-          if (vr != null) {
-            dragRange = {
-              from: Number(vr.from),
-              to: Number(vr.to),
-            };
+      // LWC may deliver range-change events synchronously from setData, so the
+      // end-of-update mark alone would arrive too late to claim them.
+      applyingDataRef.current = true;
+      try {
+        let dragRange: { from: number; to: number } | null = null;
+        if (draggingRef.current) {
+          try {
+            const vr = chart.timeScale().getVisibleRange();
+            if (vr != null) {
+              dragRange = {
+                from: Number(vr.from),
+                to: Number(vr.to),
+              };
+            }
+          } catch {
+            // chart may not be ready
           }
-        } catch {
-          // chart may not be ready
         }
-      }
 
-      // isDownsampleSwap = first data from a fresh runChartDownsample call.
-      // Only suppress range events for actual data swaps, NOT for ticks.
-      if (isDownsampleSwap) {
-        suppressRef.current = true;
-      }
+        // isDownsampleSwap = first data from a fresh runChartDownsample call.
+        // Only suppress range events for actual data swaps, NOT for ticks.
+        if (isDownsampleSwap) {
+          suppressRef.current = true;
+        }
 
-      // --- Update series data ---
-      figure.series.forEach(series => {
-        if (series.dataMapping.tableId !== tableId) return;
-        // Skip partition templates — rendered via their per-key runtime clones.
-        if (series.partition != null) return;
+        // --- Update series data ---
+        figure.series.forEach(series => {
+          if (series.dataMapping.tableId !== tableId) return;
+          // Skip partition templates — rendered via their per-key runtime clones.
+          if (series.partition != null) return;
 
-        const isAppendOnly =
-          addedCount > 0 &&
-          removedCount === 0 &&
-          !isInitialLoad &&
-          modifiedCount === 0;
+          const isAppendOnly =
+            addedCount > 0 &&
+            removedCount === 0 &&
+            !isInitialLoad &&
+            modifiedCount === 0;
 
-        // Data swap, initial load, or first rows for an empty series: full
-        // setData. Ticks on downsampled tables: incremental appends.
-        //
-        // The empty-series check matters beyond efficiency: isInitialLoad is
-        // a model-global flag consumed by whichever table's subscription
-        // fires first, so on a multi-table figure the slower table's first
-        // batch would otherwise be applied point-by-point via update().
-        // lightweight-charts only *guesses* the first point's tick-mark
-        // weight (year/month/day) when a batch of >1 points is set at once
-        // (fillWeightsForPoints); a first point inserted alone keeps weight
-        // 0 forever, flipping the first axis label from "2024" to
-        // "10:00:00" depending on which table won the subscription race.
+          // Data swap, initial load, or first rows for an empty series: full
+          // setData. Ticks on downsampled tables: incremental appends.
+          //
+          // The empty-series check matters beyond efficiency: isInitialLoad is
+          // a model-global flag consumed by whichever table's subscription
+          // fires first, so on a multi-table figure the slower table's first
+          // batch would otherwise be applied point-by-point via update().
+          // lightweight-charts only *guesses* the first point's tick-mark
+          // weight (year/month/day) when a batch of >1 points is set at once
+          // (fillWeightsForPoints); a first point inserted alone keeps weight
+          // 0 forever, flipping the first axis label from "2024" to
+          // "10:00:00" depending on which table won the subscription race.
+          if (
+            isDownsampleSwap ||
+            removedCount > 0 ||
+            isInitialLoad ||
+            !renderer.seriesHasData(series.id)
+          ) {
+            const data = transformTableData(series, colData, ct);
+            const deduped = deduplicateByTime(
+              data as Record<string, unknown>[]
+            );
+            renderer.setSeriesData(series.id, deduped as never[]);
+          } else if (isAppendOnly) {
+            const timeColName = series.dataMapping.columns.time;
+            const timeCol = colData.get(timeColName);
+            const totalRows = timeCol?.length ?? 0;
+            const start = Math.max(0, totalRows - addedCount);
+            const data = transformTableData(series, colData, ct, start);
+            // LWC's update() only appends or replaces the LAST point. A
+            // resampled table can gain rows anywhere in time order, and an
+            // out-of-order update corrupts its plot list: later reads throw
+            // 'Value is null' out of barStyleFnMap and the series vanishes.
+            // Rebuild wholesale unless this batch is a genuine append.
+            const lastTime = renderer.getLastSeriesTime(series.id);
+            const isOrderedAppend =
+              lastTime == null ||
+              data.every(d => {
+                const t = (d as { time?: unknown }).time;
+                return typeof t === 'number' && t >= lastTime;
+              });
+            if (isOrderedAppend) {
+              for (let i = 0; i < data.length; i += 1) {
+                renderer.updateSeriesPoint(series.id, data[i]);
+              }
+            } else {
+              const full = transformTableData(series, colData, ct);
+              const deduped = deduplicateByTime(
+                full as Record<string, unknown>[]
+              );
+              renderer.setSeriesData(series.id, deduped as never[]);
+            }
+          } else if (modifiedCount > 0) {
+            const data = transformTableData(series, colData, ct);
+            const deduped = deduplicateByTime(
+              data as Record<string, unknown>[]
+            );
+            renderer.setSeriesData(series.id, deduped as never[]);
+          }
+
+          if (!series.markerSpec && series.markers) {
+            renderer.setSeriesMarkers(series.id, series.markers);
+          }
+          renderer.updateDynamicPriceLines(series.id, colData);
+        });
+
+        // Table-driven markers
+        figure.series.forEach(series => {
+          if (series.markerSpec?.tableId !== tableId) return;
+          const markerColData = model.getColumnData(tableId);
+          if (!markerColData) return;
+          const tableMarkers = buildMarkersFromTableData(
+            series.markerSpec,
+            markerColData,
+            ct,
+            renderer.getTextColor()
+          );
+          renderer.setSeriesMarkers(series.id, tableMarkers);
+        });
+
+        // --- Update scaffold on data swap ---
+        // Non-resampled continuous charts have no swap events; their scaffold
+        // tracks the data extent (padded on ticks; rebuilt only when the data
+        // escapes coverage — see scaffoldCoverageRef).
         if (
           isDownsampleSwap ||
-          removedCount > 0 ||
-          isInitialLoad ||
-          !renderer.seriesHasData(series.id)
+          (!model.isResampling() && shouldEnableScaffold(renderer, model))
         ) {
-          const data = transformTableData(series, colData, ct);
-          const deduped = deduplicateByTime(data as Record<string, unknown>[]);
-          renderer.setSeriesData(series.id, deduped as never[]);
-        } else if (isAppendOnly) {
-          const timeColName = series.dataMapping.columns.time;
-          const timeCol = colData.get(timeColName);
-          const totalRows = timeCol?.length ?? 0;
-          const start = Math.max(0, totalRows - addedCount);
-          const data = transformTableData(series, colData, ct, start);
-          for (let i = 0; i < data.length; i += 1) {
-            renderer.updateSeriesPoint(series.id, data[i]);
+          updateScaffold(renderer, model);
+          // The scaffold shifts the time-scale indices markers were mapped
+          // onto. LWC resolves them with an exact dataByIndex match and paints
+          // a missed marker at the top of the pane, so re-map them here.
+          renderer.refreshMarkers();
+        }
+
+        // --- Viewport control ---
+        // A resample in flight means the visible range is mid-negotiation: the
+        // swap that lands next carries the range the user asked for. Re-fitting
+        // on a tick that arrives in that window throws the zoom away (and on a
+        // ticking source those arrive constantly), so only an explicit reset or
+        // the very first load may re-fit while one is pending.
+        const resamplePending = model.pendingDownsample || model.pendingAutoBin;
+        const willFit =
+          isResetView === true ||
+          isInitialLoad === true ||
+          (!userInteractedRef.current &&
+            !draggingRef.current &&
+            !resamplePending &&
+            !suppressRef.current);
+        if (willFit) {
+          // Reset, initial load, or pre-interaction tick / late-arriving table:
+          // keep the visible range glued to the full data extent. Once the user
+          // zooms or pans, userInteractedRef flips and we stop re-fitting.
+          restoreRangeRef.current = null;
+          renderer.fitContent();
+        } else if (isDownsampleSwap) {
+          // Zoom/pan data swap: restore the exact visible range the user had
+          const rangeToRestore = dragRange ?? restoreRangeRef.current;
+          try {
+            if (rangeToRestore != null) {
+              chart.timeScale().setVisibleRange({
+                from: rangeToRestore.from,
+                to: rangeToRestore.to,
+              } as never);
+            }
+          } catch {
+            // chart may not be ready
           }
-        } else if (modifiedCount > 0) {
-          const data = transformTableData(series, colData, ct);
-          const deduped = deduplicateByTime(data as Record<string, unknown>[]);
-          renderer.setSeriesData(series.id, deduped as never[]);
-        }
-
-        if (!series.markerSpec && series.markers) {
-          renderer.setSeriesMarkers(series.id, series.markers);
-        }
-        renderer.updateDynamicPriceLines(series.id, colData);
-      });
-
-      // Table-driven markers
-      figure.series.forEach(series => {
-        if (series.markerSpec?.tableId !== tableId) return;
-        const markerColData = model.getColumnData(tableId);
-        if (!markerColData) return;
-        const tableMarkers = buildMarkersFromTableData(
-          series.markerSpec,
-          markerColData,
-          ct,
-          renderer.getTextColor()
-        );
-        renderer.setSeriesMarkers(series.id, tableMarkers);
-      });
-
-      // --- Update scaffold on data swap ---
-      // Non-resampled continuous charts have no swap events; their scaffold
-      // tracks the data extent (padded on ticks; rebuilt only when the data
-      // escapes coverage — see scaffoldCoverageRef).
-      if (
-        isDownsampleSwap ||
-        (!model.isResampling() && shouldEnableScaffold(renderer, model))
-      ) {
-        updateScaffold(renderer, model);
-      }
-
-      // --- Viewport control ---
-      if (
-        isResetView === true ||
-        isInitialLoad === true ||
-        (!userInteractedRef.current && !draggingRef.current)
-      ) {
-        // Reset, initial load, or pre-interaction tick / late-arriving table:
-        // keep the visible range glued to the full data extent. Once the user
-        // zooms or pans, userInteractedRef flips and we stop re-fitting.
-        restoreRangeRef.current = null;
-        renderer.fitContent();
-      } else if (isDownsampleSwap) {
-        // Zoom/pan data swap: restore the exact visible range the user had
-        const rangeToRestore = dragRange ?? restoreRangeRef.current;
-        try {
-          if (rangeToRestore != null) {
-            chart.timeScale().setVisibleRange({
-              from: rangeToRestore.from,
-              to: rangeToRestore.to,
-            } as never);
-          }
-        } catch {
-          // chart may not be ready
-        }
-      } else if (addedCount > 0 && !isInitialLoad && !draggingRef.current) {
-        // Ticking: snap-to-live if right edge is near latest data
-        try {
-          const vr = chart.timeScale().getVisibleRange();
-          if (vr != null) {
-            const visFrom = Number(vr.from);
-            const visTo = Number(vr.to);
-            const visDur = visTo - visFrom;
-            const timeColName = figure.series[0]?.dataMapping.columns.time;
-            const timeArr = timeColName ? colData.get(timeColName) : undefined;
-            if (timeArr && timeArr.length > 0 && visDur > 0) {
-              const lastTime = timeArr[timeArr.length - 1] as number;
-              const gap = lastTime - visTo;
-              if (gap > 0 && gap < visDur * 0.01) {
-                chart.timeScale().setVisibleRange({
-                  from: visFrom + gap,
-                  to: lastTime,
-                } as never);
+        } else if (addedCount > 0 && !isInitialLoad && !draggingRef.current) {
+          // Ticking: snap-to-live if right edge is near latest data
+          try {
+            const vr = chart.timeScale().getVisibleRange();
+            if (vr != null) {
+              const visFrom = Number(vr.from);
+              const visTo = Number(vr.to);
+              const visDur = visTo - visFrom;
+              const timeColName = figure.series[0]?.dataMapping.columns.time;
+              const timeArr = timeColName
+                ? colData.get(timeColName)
+                : undefined;
+              if (timeArr && timeArr.length > 0 && visDur > 0) {
+                const lastTime = timeArr[timeArr.length - 1] as number;
+                const gap = lastTime - visTo;
+                if (gap > 0 && gap < visDur * 0.01) {
+                  chart.timeScale().setVisibleRange({
+                    from: visFrom + gap,
+                    to: lastTime,
+                  } as never);
+                }
               }
             }
+          } catch {
+            // chart may not be ready
           }
-        } catch {
-          // chart may not be ready
         }
-      }
 
-      // --- Price-axis width flush ---
-      // LWC freezes a price scale at the widest width it has ever needed
-      // ("avoid price scale is shrunk" guard in PriceAxisWidget): when the
-      // chart lays out before its first data, the width comes from a
-      // no-tick-marks fallback constant (34px -> a 56px axis) and never
-      // shrinks to the measured labels (-> 52px), so the same chart renders
-      // 4px wider or narrower depending on whether layout or data won the
-      // race. An empty applyOptions() runs the one full layout pass whose
-      // size-adjust CAN shrink the axis to the current optimal width.
-      // Called in the same task as the data update so both invalidations
-      // coalesce into a single painted frame — no visible width snap.
-      // Skipped for pure appends after a table's first flush: a width
-      // INCREASE already triggers LWC's own full update, and per-tick full
-      // updates would be wasteful. (The first append still flushes — a
-      // table_publisher feed delivers its initial rows as an append.)
-      if (
-        isInitialLoad ||
-        isDownsampleSwap ||
-        removedCount > 0 ||
-        modifiedCount > 0 ||
-        (addedCount > 0 && !widthFlushedTablesRef.current.has(tableId))
-      ) {
-        widthFlushedTablesRef.current.add(tableId);
-        try {
-          chart.applyOptions({});
-          // A width change re-anchors the viewport but does NOT recompute
-          // bar spacing: a fitContent computed at the old pane width leaves
-          // the content stretched ~(4px / paneWidth) after the axis
-          // settles. Re-fit pre-interaction charts so the final spacing is
-          // computed at the final width.
-          if (!userInteractedRef.current && !draggingRef.current) {
-            renderer.fitContent();
+        // --- Price-axis width flush ---
+        // LWC freezes a price scale at the widest width it has ever needed
+        // ("avoid price scale is shrunk" guard in PriceAxisWidget): when the
+        // chart lays out before its first data, the width comes from a
+        // no-tick-marks fallback constant (34px -> a 56px axis) and never
+        // shrinks to the measured labels (-> 52px), so the same chart renders
+        // 4px wider or narrower depending on whether layout or data won the
+        // race. An empty applyOptions() runs the one full layout pass whose
+        // size-adjust CAN shrink the axis to the current optimal width.
+        // Called in the same task as the data update so both invalidations
+        // coalesce into a single painted frame — no visible width snap.
+        // Skipped for pure appends after a table's first flush: a width
+        // INCREASE already triggers LWC's own full update, and per-tick full
+        // updates would be wasteful. (The first append still flushes — a
+        // table_publisher feed delivers its initial rows as an append.)
+        if (
+          isInitialLoad ||
+          isDownsampleSwap ||
+          removedCount > 0 ||
+          modifiedCount > 0 ||
+          (addedCount > 0 && !widthFlushedTablesRef.current.has(tableId))
+        ) {
+          widthFlushedTablesRef.current.add(tableId);
+          try {
+            chart.applyOptions({});
+            // A width change re-anchors the viewport but does NOT recompute
+            // bar spacing: a fitContent computed at the old pane width leaves
+            // the content stretched ~(4px / paneWidth) after the axis
+            // settles. Re-fit pre-interaction charts so the final spacing is
+            // computed at the final width.
+            if (!userInteractedRef.current && !draggingRef.current) {
+              renderer.fitContent();
+            }
+          } catch {
+            // chart may already be disposed
           }
-        } catch {
-          // chart may already be disposed
         }
-      }
 
-      // --- Un-suppress after delay (only for data swaps) ---
-      // 600ms gives the chart time to settle after fitContent before we let
-      // range-change events trigger another resample. Auto-bin's RESET path
-      // is sensitive to this — a too-short window lets a buffered-full-range
-      // ZOOM race the RESET and re-aggregate at the previous (zoomed) width.
-      if (isDownsampleSwap) {
-        if (suppressTimerRef.current) clearTimeout(suppressTimerRef.current);
-        suppressTimerRef.current = setTimeout(() => {
-          suppressRef.current = false;
-        }, 600);
+        // Every viewport move above is ours, including the implicit one setData
+        // makes by growing the data extent. Recording the settled range here
+        // keeps the range-change handler from mistaking any of them for a
+        // gesture and replaying a stale range on the next swap.
+        markProgrammaticViewport(chart.timeScale());
+
+        // --- Un-suppress after delay (only for data swaps) ---
+        // 600ms gives the chart time to settle after fitContent before we let
+        // range-change events trigger another resample. Auto-bin's RESET path
+        // is sensitive to this — a too-short window lets a buffered-full-range
+        // ZOOM race the RESET and re-aggregate at the previous (zoomed) width.
+        if (isDownsampleSwap) {
+          if (suppressTimerRef.current) clearTimeout(suppressTimerRef.current);
+          suppressTimerRef.current = setTimeout(() => {
+            suppressRef.current = false;
+          }, 600);
+        }
+      } finally {
+        applyingDataRef.current = false;
       }
     }
 
@@ -1314,8 +1404,6 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
       // Baseline: the range we last sent a downsample request for.
       // Used to detect whether the user has zoomed/panned enough to
       // warrant a new downsample. Starts null — captured after settle.
-      let baselineFrom: number | null = null;
-      let baselineTo: number | null = null;
 
       // Let the chart settle for 1s after init (fitContent, resize, etc.)
       // before we start listening to range changes.
@@ -1324,8 +1412,10 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
         try {
           const vr = timeScale.getVisibleRange();
           if (vr != null) {
-            baselineFrom = Number(vr.from);
-            baselineTo = Number(vr.to);
+            baselineRef.current = {
+              from: Number(vr.from),
+              to: Number(vr.to),
+            };
           }
         } catch {
           // chart may not be ready
@@ -1393,6 +1483,7 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
                 from: center - half,
                 to: center + half,
               } as never);
+              markProgrammaticViewport(timeScale);
             }
           } catch {
             // chart may not be ready
@@ -1409,13 +1500,39 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
       window.addEventListener('pointercancel', onUp, true);
 
       /**
+       * Zoom (>10% duration change) or pan (>20% center shift) vs baseline.
+       */
+      function detectGesture(visFrom: number, visTo: number): boolean {
+        const baseline = baselineRef.current;
+        if (baseline == null) return false;
+        const visDur = visTo - visFrom;
+        if (visDur < 1) return false;
+        const baseDur = baseline.to - baseline.from;
+        const durChange =
+          baseDur > 0
+            ? Math.abs(visDur - baseDur) / Math.max(visDur, baseDur)
+            : 1;
+        if (durChange > 0.1) return true;
+        const centerShift =
+          Math.abs((visFrom + visTo) / 2 - (baseline.from + baseline.to) / 2) /
+          visDur;
+        return centerShift > 0.2;
+      }
+
+      /**
        * Core logic: compare current visible range against baseline.
        * If zoomed (>10% duration change) or panned (>20% center shift),
        * request a new downsample with the visible range + 50% buffer.
        */
       function processRangeChange(): void {
-        if (suppressRef.current) return;
-        if (Date.now() < dblClickGuardUntil) return;
+        // Retry rather than drop: a gesture made while the chart is settling
+        // after a swap is still the user's intent, and discarding it is why a
+        // zoom sometimes never reached the server.
+        if (suppressRef.current || Date.now() < dblClickGuardUntil) {
+          if (debounceTimer) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(processRangeChange, 200);
+          return;
+        }
 
         const vr = timeScale.getVisibleRange();
         if (vr == null) return;
@@ -1425,33 +1542,18 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
         if (visDur < 1) return;
 
         // Capture baseline on first event
-        if (baselineFrom == null || baselineTo == null) {
-          baselineFrom = visFrom;
-          baselineTo = visTo;
+        if (baselineRef.current == null) {
+          baselineRef.current = { from: visFrom, to: visTo };
           return;
         }
 
-        const baseDur = baselineTo - baselineFrom;
-        const durChange =
-          baseDur > 0
-            ? Math.abs(visDur - baseDur) / Math.max(visDur, baseDur)
-            : 1;
-        const centerShift =
-          visDur > 0
-            ? Math.abs(
-                (visFrom + visTo) / 2 - (baselineFrom + baselineTo) / 2
-              ) / visDur
-            : 0;
-
-        const isZoom = durChange > 0.1;
-        const isPanOnly = !isZoom && centerShift > 0.2;
-        if (isZoom || isPanOnly) {
-          // User-initiated zoom/pan: from now on the chart respects their
-          // viewport choice, so handleDataUpdate stops auto-fitting.
+        const isZoom = detectGesture(visFrom, visTo);
+        if (isZoom) {
+          // Already claimed synchronously in the range-change handler; this
+          // re-assert covers the direct call from the drag-end path.
           userInteractedRef.current = true;
           // Update baseline to current visible range
-          baselineFrom = visFrom;
-          baselineTo = visTo;
+          baselineRef.current = { from: visFrom, to: visTo };
 
           // Buffer the visible window for the resample request. Tracks
           // the 20% pan-detection threshold above so a fresh build's
@@ -1466,7 +1568,7 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
           lastDsRangeRef.current = [dsFrom, dsTo];
 
           updateDebugState(
-            gatherDebug(isZoom ? 'ZOOM' : 'PAN', model, renderer),
+            gatherDebug('ZOOM', model, renderer),
             model,
             renderer
           );
@@ -1499,13 +1601,45 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
             buildStateJson(model, renderer)
           );
         }
-        if (!settled || suppressRef.current) return;
+        if (!settled) return;
+        if (applyingDataRef.current) return;
+        // Our own fit/restore: adopt the result as the new baseline so the
+        // next real gesture is measured against what the user actually sees.
+        const prog = programmaticRangeRef.current;
+        if (prog != null) {
+          const vr = timeScale.getVisibleRange();
+          const matches =
+            vr != null &&
+            Math.abs(Number(vr.from) - prog.from) < 0.5 &&
+            Math.abs(Number(vr.to) - prog.to) < 0.5;
+          programmaticRangeRef.current = null;
+          if (matches) {
+            baselineRef.current = prog;
+            return;
+          }
+        }
         if (draggingRef.current) {
           userInteractedRef.current = true;
           needsProcessAfterDrag = true;
           return;
         }
         // Debounce for wheel zoom (fires many events quickly)
+        // Claim the gesture now, not after the debounce: a tick landing in
+        // that window would otherwise still see userInteracted false, re-fit,
+        // and undo the zoom before it was ever recorded.
+        try {
+          const vr = timeScale.getVisibleRange();
+          if (vr != null) {
+            const visFrom = Number(vr.from);
+            const visTo = Number(vr.to);
+            if (detectGesture(visFrom, visTo)) {
+              userInteractedRef.current = true;
+              restoreRangeRef.current = { from: visFrom, to: visTo };
+            }
+          }
+        } catch {
+          // chart may not be ready
+        }
         if (debounceTimer) clearTimeout(debounceTimer);
         debounceTimer = setTimeout(processRangeChange, 200);
       });
@@ -1527,8 +1661,7 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
         // Dblclick is a "snap back to full" gesture — re-arm auto-fit so
         // late ticks keep extending the visible range until the user zooms.
         userInteractedRef.current = false;
-        baselineFrom = null;
-        baselineTo = null;
+        baselineRef.current = null;
         restoreRangeRef.current = null; // fitContent, not restore
         lastDsRangeRef.current = null; // full range
         renderer.resetPriceScales();
@@ -1567,6 +1700,7 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
         ) {
           lastFitWidth = width;
           renderer.fitContent();
+          markProgrammaticViewport(timeScale);
         }
         if (!settled || suppressRef.current) return;
         if (Date.now() < dblClickGuardUntil) return;

@@ -18,7 +18,9 @@ const mockSeriesInstance = {
   applyOptions: jest.fn(),
   options: jest.fn(() => ({})),
   priceFormatter: jest.fn(() => ({ format: v => String(v) })),
-  priceToCoordinate: jest.fn(() => null),
+  // Non-null: LWC throws 'Value is null' if a marker price can't convert,
+  // so the renderer only attaches prices when this succeeds.
+  priceToCoordinate: jest.fn(() => 50),
 };
 
 const mockMarkersPlugin = {

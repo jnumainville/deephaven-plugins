@@ -137,6 +137,16 @@ describe('real LWC + ContinuousBarsSeries on the autobin shape', () => {
     expect((bars[5].originalData as { time?: number }).time).toBeUndefined();
     expect(Number.isFinite(bars[5].originalData.ts)).toBe(true);
 
+    // The public data() round-trip DOES preserve numeric times (unlike the
+    // renderer-facing originalData above), so it is a valid source for
+    // marker anchoring.
+    const roundTripped = (
+      series as unknown as { data: () => Array<{ time?: unknown }> }
+    ).data();
+    expect(roundTripped.filter(d => typeof d.time === 'number').length).toBe(
+      data.length
+    );
+
     const times = bars.map(b =>
       Number(
         (b.originalData as { ts?: number; time?: number }).ts ??

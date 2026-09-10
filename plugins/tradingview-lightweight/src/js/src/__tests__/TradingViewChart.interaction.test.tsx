@@ -32,7 +32,10 @@ const mockColumnData = new Map<string, unknown[]>([
   ['Value', [10, 11, 12, 13]],
 ]);
 
-let mockVisibleRange = { from: 0, to: 100 };
+let mockVisibleRange: { from: number; to: number } | null = {
+  from: 0,
+  to: 100,
+};
 // Toggles the mock model's resampling state so tests can exercise the plain
 // ticking (non-downsampled) path as well as the downsampled path.
 let mockIsResampling = true;
@@ -114,7 +117,11 @@ jest.mock('../TradingViewChartRenderer', () => {
 
     setSeriesMarkers = jest.fn();
 
+    refreshMarkers = jest.fn();
+
     updateDynamicPriceLines = jest.fn();
+
+    getLastSeriesTime = jest.fn(() => undefined);
 
     isScaffoldEnabled = jest.fn(() => false);
 
@@ -345,6 +352,158 @@ describe('TradingViewChart drag viewport handling', () => {
       from: 10,
       to: 60,
     });
+  });
+
+  it('retries a zoom made while the chart is settling after a swap', async () => {
+    // A swap suppresses range handling for 600ms. A gesture in that window is
+    // still the user's intent, so it must reach the server rather than be
+    // dropped.
+    await renderChart();
+    const model = mockModelInstances[0] as { performResample: jest.Mock };
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(200);
+    });
+
+    // A swap starts the suppression window.
+    emitDataUpdate({ isDownsampleSwap: true });
+    model.performResample.mockClear();
+
+    // User zooms while suppressed.
+    mockVisibleRange = { from: 40, to: 60 };
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(200);
+    });
+    expect(model.performResample).not.toHaveBeenCalled();
+
+    // Once suppression lifts, the retry delivers it.
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(model.performResample).toHaveBeenCalledWith([36, 64], 1000);
+  });
+
+  it('still resamples when a data update lands before the zoom debounce', async () => {
+    // Data updates must not move the gesture baseline, or a zoom whose
+    // debounce has not fired yet is compared against its own range, no
+    // resample is sent, and the chart stays on stale downsampled data.
+    await renderChart();
+    const model = mockModelInstances[0] as { performResample: jest.Mock };
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(200);
+    });
+
+    // User zooms out, then a tick arrives before the 200ms debounce fires.
+    mockVisibleRange = { from: 0, to: 400 };
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(50);
+    });
+    model.performResample.mockClear();
+    emitDataUpdate({ addedCount: 1 });
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(model.performResample).toHaveBeenCalledWith([-80, 480], 1000);
+  });
+
+  it('detects the first zoom when data loads after the settle timer', async () => {
+    // A slow first load (big_multi) has no visible range when the settle timer
+    // fires, so the baseline must come from the fit that follows the data.
+    // Without it the first zoom only captures a baseline and the next tick
+    // re-fits, resetting the view.
+    mockIsResampling = false;
+    mockVisibleRange = null;
+    await renderChart();
+    const renderer = mockRendererInstances[0] as { fitContent: jest.Mock };
+
+    act(() => {
+      jest.advanceTimersByTime(1000); // settle with no range available
+    });
+
+    // Data lands and the chart fits to it.
+    mockVisibleRange = { from: 0, to: 100 };
+    emitDataUpdate({ addedCount: 1 });
+
+    // First zoom must be recognised immediately.
+    mockVisibleRange = { from: 30, to: 70 };
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(50);
+    });
+
+    renderer.fitContent.mockClear();
+    emitDataUpdate({ addedCount: 1 });
+    expect(renderer.fitContent).not.toHaveBeenCalled();
+  });
+
+  it('does not treat a range change caused by new data as a user gesture', async () => {
+    // setData moves the visible time range by growing the data extent. Reading
+    // that as a zoom would save it as the range to restore and replay it on
+    // the next swap, making the viewport jump and series flicker.
+    mockIsResampling = false;
+    await renderChart();
+    const renderer = mockRendererInstances[0] as { fitContent: jest.Mock };
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(200);
+    });
+
+    // A data update that shifts the range; LWC reports it after the fact.
+    act(() => {
+      mockVisibleRange = { from: 30, to: 70 };
+      emitDataUpdate({ addedCount: 1 });
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(200);
+    });
+
+    // Still pre-interaction: ticks keep gluing the view to the live extent.
+    renderer.fitContent.mockClear();
+    emitDataUpdate({ addedCount: 1 });
+    expect(renderer.fitContent).toHaveBeenCalled();
+  });
+
+  it('does not re-fit on a tick that lands between a zoom and its debounce', async () => {
+    // The gesture must be claimed on the range-change event, not 200ms later:
+    // a tick in that window would otherwise re-fit and undo the zoom before it
+    // was ever recorded, so the zoom appears to reset over and over.
+    mockIsResampling = false;
+    await renderChart();
+    const renderer = mockRendererInstances[0] as { fitContent: jest.Mock };
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(200);
+    });
+
+    // User zooms, but only 50ms pass before a tick arrives.
+    mockVisibleRange = { from: 30, to: 70 };
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(50);
+    });
+
+    renderer.fitContent.mockClear();
+    emitDataUpdate({ addedCount: 1 });
+    expect(renderer.fitContent).not.toHaveBeenCalled();
   });
 
   it('tracks zoom on a non-resampled ticking chart so later ticks stop re-fitting', async () => {

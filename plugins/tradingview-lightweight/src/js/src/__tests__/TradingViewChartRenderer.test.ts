@@ -709,6 +709,30 @@ describe('TradingViewChartRenderer', () => {
       expect(mockSeriesInstance.setData).toHaveBeenCalledWith(data);
     });
 
+    it('sorts out-of-order data before handing it to lightweight-charts', () => {
+      const renderer = createRenderer();
+      renderer.configureSeries([
+        {
+          id: 'line-1',
+          type: 'Line',
+          options: {},
+          dataMapping: { tableId: 0, columns: { time: 'T' } },
+        },
+      ]);
+
+      renderer.setSeriesData('line-1', [
+        { time: 1704240000, value: 110 },
+        { time: 1704067200, value: 100 },
+        { time: 1704153600, value: 105 },
+      ]);
+
+      expect(mockSeriesInstance.setData).toHaveBeenCalledWith([
+        { time: 1704067200, value: 100 },
+        { time: 1704153600, value: 105 },
+        { time: 1704240000, value: 110 },
+      ]);
+    });
+
     it('should not throw when series id is not found', () => {
       const renderer = createRenderer();
       expect(() => renderer.setSeriesData('nonexistent', [])).not.toThrow();
@@ -797,6 +821,187 @@ describe('TradingViewChartRenderer', () => {
       const renderer = createRenderer();
       expect(() => renderer.setSeriesMarkers('nonexistent', [])).not.toThrow();
       expect(createSeriesMarkers).not.toHaveBeenCalled();
+    });
+
+    it('snaps marker times to real data points', () => {
+      // Regression: on a scaffolded (continuous) chart most indices are
+      // whitespace, and LWC re-anchors markers through dataByIndex, which
+      // returns null there — markers jump as data ticks in.
+      const renderer = createRenderer();
+      renderer.configureSeries([
+        {
+          id: 'candle-1',
+          type: 'Candlestick',
+          options: {},
+          dataMapping: { tableId: 0, columns: { time: 'T' } },
+        },
+      ]);
+      renderer.setSeriesData('candle-1', [
+        { time: 100, close: 1 },
+        { time: 200, close: 2 },
+        { time: 300, close: 3 },
+      ]);
+
+      renderer.setSeriesMarkers('candle-1', [
+        { time: 170, position: 'belowBar', shape: 'arrowUp', text: 'Buy' },
+        { time: 260, position: 'aboveBar', shape: 'arrowDown', text: 'Sell' },
+      ]);
+
+      const applied = createSeriesMarkers.mock.calls[0][1] as Array<{
+        time: number;
+      }>;
+      expect(applied.map(m => m.time)).toEqual([200, 300]);
+    });
+
+    it('snaps date-string marker times onto the nearest bar', () => {
+      // The smoke-test / docs pattern: markers are declared with a
+      // `YYYY-MM-DD` string, which resolves to UTC midnight and so never
+      // coincides with a bar's real timestamp.
+      const renderer = createRenderer();
+      renderer.configureSeries([
+        {
+          id: 'candle-1',
+          type: 'Candlestick',
+          options: {},
+          dataMapping: { tableId: 0, columns: { time: 'T' } },
+        },
+      ]);
+      const jan5 = Date.UTC(2024, 0, 5) / 1000;
+      const jan6 = Date.UTC(2024, 0, 6) / 1000;
+      // Bars sit at 10:00, not midnight.
+      renderer.setSeriesData('candle-1', [
+        { time: jan5 + 36000, close: 1 },
+        { time: jan6 + 36000, close: 2 },
+      ]);
+
+      renderer.setSeriesMarkers('candle-1', [
+        {
+          time: '2024-01-05',
+          position: 'belowBar',
+          shape: 'arrowUp',
+          text: 'Buy',
+        },
+      ]);
+
+      const applied = createSeriesMarkers.mock.calls[0][1] as Array<{
+        time: number;
+      }>;
+      expect(applied[0].time).toBe(jan5 + 36000);
+    });
+
+    it('gives markers an explicit price from their bar', () => {
+      // Regression: LWC derives a marker's y from the series row at its
+      // index and returns WITHOUT setting y when the row shape isn't one it
+      // recognizes — which is the custom (continuous) series case, and left
+      // markers parked at the top of the pane. An explicit price
+      // short-circuits that lookup.
+      const renderer = createRenderer();
+      renderer.configureSeries([
+        {
+          id: 'candle-1',
+          type: 'Candlestick',
+          options: {},
+          dataMapping: { tableId: 0, columns: { time: 'T' } },
+        },
+      ]);
+      renderer.setSeriesData('candle-1', [
+        { time: 100, open: 5, high: 12, low: 3, close: 9 },
+        { time: 200, open: 9, high: 15, low: 7, close: 14 },
+      ]);
+
+      renderer.setSeriesMarkers('candle-1', [
+        { time: 100, position: 'belowBar', shape: 'arrowUp', text: 'Buy' },
+        { time: 200, position: 'aboveBar', shape: 'arrowDown', text: 'Sell' },
+      ]);
+
+      const applied = createSeriesMarkers.mock.calls[0][1] as Array<{
+        price?: number;
+      }>;
+      expect(applied[0].price).toBe(3); // belowBar -> low
+      expect(applied[1].price).toBe(15); // aboveBar -> high
+    });
+
+    it('refreshMarkers re-maps every series onto the current indices', () => {
+      // The scaffold shifts time-scale indices. LWC caches a logical index per
+      // marker and resolves it with an exact dataByIndex match, painting a
+      // missed marker at the top of the pane.
+      const renderer = createRenderer();
+      renderer.configureSeries([
+        {
+          id: 'candle-1',
+          type: 'Candlestick',
+          options: {},
+          dataMapping: { tableId: 0, columns: { time: 'T' } },
+        },
+      ]);
+      renderer.setSeriesData('candle-1', [
+        { time: 100, open: 5, high: 12, low: 3, close: 9 },
+      ]);
+      renderer.setSeriesMarkers('candle-1', [
+        { time: 100, position: 'belowBar', shape: 'arrowUp', text: 'Buy' },
+      ]);
+
+      mockMarkersPlugin.setMarkers.mockClear();
+      renderer.refreshMarkers();
+
+      expect(mockMarkersPlugin.setMarkers).toHaveBeenCalledTimes(1);
+      expect(mockMarkersPlugin.setMarkers.mock.calls[0][0]).toEqual([
+        expect.objectContaining({ time: 100, position: 'belowBar' }),
+      ]);
+    });
+
+    it('re-anchors markers when data arrives for an empty series', () => {
+      // A reset swaps data in table by table, so table-driven markers can be
+      // applied while their series is still empty. LWC parks those at the top
+      // of the pane, which reads as the markers jumping into place a tick
+      // later; setSeriesData must re-anchor them in the same frame.
+      const renderer = createRenderer();
+      renderer.configureSeries([
+        {
+          id: 'candle-1',
+          type: 'Candlestick',
+          options: {},
+          dataMapping: { tableId: 0, columns: { time: 'T' } },
+        },
+      ]);
+
+      renderer.setSeriesMarkers('candle-1', [
+        { time: 100, position: 'belowBar', shape: 'arrowUp', text: 'Buy' },
+      ]);
+      expect(
+        (createSeriesMarkers.mock.calls[0][1] as Array<{ price?: number }>)[0]
+          .price
+      ).toBeUndefined();
+
+      renderer.setSeriesData('candle-1', [
+        { time: 100, open: 5, high: 12, low: 3, close: 9 },
+      ]);
+
+      const applied = mockMarkersPlugin.setMarkers.mock.calls.at(-1)?.[0] as
+        | Array<{ price?: number }>
+        | undefined;
+      expect(applied?.[0].price).toBe(3);
+    });
+
+    it('keeps marker times when the series has no data yet', () => {
+      const renderer = createRenderer();
+      renderer.configureSeries([
+        {
+          id: 'line-1',
+          type: 'Line',
+          options: {},
+          dataMapping: { tableId: 0, columns: { time: 'T' } },
+        },
+      ]);
+
+      renderer.setSeriesMarkers('line-1', [
+        { time: 170, position: 'belowBar', shape: 'arrowUp', text: 'Buy' },
+      ]);
+
+      const applied = createSeriesMarkers.mock.calls[0][1] as Array<{
+        time: number;
+      }>;
+      expect(applied[0].time).toBe(170);
     });
   });
 
