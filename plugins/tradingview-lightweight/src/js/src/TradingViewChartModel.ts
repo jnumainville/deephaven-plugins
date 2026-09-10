@@ -962,6 +962,11 @@ class TradingViewChartModel {
       },
       paneIndex: template.paneIndex,
       priceScaleOptions: template.priceScaleOptions,
+      // The template itself is never rendered, so annotations would be lost
+      // for every generated series without copying them here.
+      markers: template.markers,
+      markerSpec: template.markerSpec,
+      priceLines: template.priceLines,
     };
 
     // Push the series config BEFORE subscribing so that

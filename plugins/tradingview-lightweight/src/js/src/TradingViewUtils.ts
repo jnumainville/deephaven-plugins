@@ -13,6 +13,11 @@ import { resolveColor } from './TradingViewColors';
  * calling `getComputedStyle` once per row.
  */
 const rowColorCache = new Map<string, string | undefined>();
+
+/** Theme tokens resolve to different concrete colors per theme. */
+export function clearRowColorCache(): void {
+  rowColorCache.clear();
+}
 function resolveRowColor(value: unknown): unknown {
   if (typeof value !== 'string' || value === '') return value;
   let cached = rowColorCache.get(value);

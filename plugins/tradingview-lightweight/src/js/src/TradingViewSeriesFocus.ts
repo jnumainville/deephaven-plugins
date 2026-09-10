@@ -79,10 +79,11 @@ export function resolveFocusedSeriesPoint(
       typeof series.priceToCoordinate === 'function'
         ? series.priceToCoordinate(extracted.price)
         : null;
-    // No coordinate (e.g. value off-scale): treat distance as 0 so a series
-    // can still resolve, which matters for single-series charts.
-    const dist = y == null || point == null ? 0 : Math.abs(y - point.y);
-    if (dist < bestDist) {
+    // Keep an unprojectable series (e.g. value off-scale) only as a fallback
+    // so single-series charts still resolve; anything with a real coordinate
+    // must win regardless of cursor position.
+    const dist = y == null || point == null ? Infinity : Math.abs(y - point.y);
+    if (best == null || dist < bestDist) {
       bestDist = dist;
       best = { series, ...extracted };
     }

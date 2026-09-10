@@ -22,6 +22,7 @@ import {
   transformTableData,
   deduplicateByTime,
   buildMarkersFromTableData,
+  clearRowColorCache,
   convertTime,
   unconvertTime,
 } from './TradingViewUtils';
@@ -1813,6 +1814,7 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
     );
 
     renderer.applyOptions(mergedOptions);
+    clearRowColorCache();
     replayAllData(renderer, model);
   }, [chartTheme, replayAllData]);
 

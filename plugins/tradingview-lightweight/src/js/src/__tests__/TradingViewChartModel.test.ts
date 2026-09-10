@@ -604,6 +604,46 @@ describe('TradingViewChartModel partition downsampling', () => {
     });
   });
 
+  it('carries annotations from the partition template onto runtime series', async () => {
+    // The template itself is never rendered, so markers/markerSpec/priceLines
+    // supplied alongside by= would silently vanish from every series.
+    const dh = makeMockDh();
+    const widget = makeMockWidget();
+    const model = new TradingViewChartModel(dh, widget as never);
+
+    const partitionedTable = makeMockPartitionedTable(
+      new Map([['aaa', new MockTable(10)]])
+    );
+    runDownsampleMock(dh);
+
+    const figure = makePartitionFigure();
+    figure.series[0].markers = [
+      { time: 100, position: 'aboveBar', shape: 'circle', text: 'M' },
+    ];
+    figure.series[0].priceLines = [{ price: 5, title: 'Support' }];
+
+    await model.init(
+      [
+        { fetch: jest.fn().mockResolvedValue(new MockTable(10_000_000)) },
+        { fetch: jest.fn().mockResolvedValue(partitionedTable) },
+      ] as never,
+      JSON.stringify({
+        type: 'NEW_FIGURE',
+        figure,
+        revision: 1,
+        new_references: [0, 1],
+        removed_references: [],
+      })
+    );
+
+    const runtime = model
+      .getFigureData()
+      ?.series.find(s => s.id === 'series_0_aaa');
+    expect(runtime).toBeDefined();
+    expect(runtime?.markers).toEqual(figure.series[0].markers);
+    expect(runtime?.priceLines).toEqual(figure.series[0].priceLines);
+  });
+
   it('subscribes small partition constituents directly', async () => {
     const dh = makeMockDh();
     const widget = makeMockWidget();

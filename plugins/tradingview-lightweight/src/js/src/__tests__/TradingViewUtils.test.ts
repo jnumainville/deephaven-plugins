@@ -1,10 +1,12 @@
 import type { TvlMarkerSpec, TvlSeriesConfig } from '../TradingViewTypes';
+import * as colors from '../TradingViewColors';
 import {
   convertTime,
   transformTableData,
   getRequiredColumns,
   getAllColumnsForTable,
   buildMarkersFromTableData,
+  clearRowColorCache,
 } from '../TradingViewUtils';
 
 describe('convertTime', () => {
@@ -792,5 +794,49 @@ describe('buildMarkersFromTableData', () => {
 
     const result = buildMarkersFromTableData(spec, columnData);
     expect(result[0].price).toBe(100);
+  });
+});
+
+describe('clearRowColorCache', () => {
+  // Theme tokens resolve to different concrete colors per theme, so a cache
+  // that survives a theme change keeps painting the previous theme's colors.
+  const colorSeries: TvlSeriesConfig = {
+    id: 's1',
+    type: 'Line',
+    options: {},
+    dataMapping: {
+      tableId: 0,
+      columns: { time: 'T', value: 'V', color: 'C' },
+    },
+  };
+  const columnData = new Map<string, unknown[]>([
+    ['T', [1000]],
+    ['V', [1]],
+    ['C', ['positive']],
+  ]);
+
+  function firstColor(): unknown {
+    const [point] = transformTableData(colorSeries, columnData) as Array<
+      Record<string, unknown>
+    >;
+    return point.color;
+  }
+
+  it('re-resolves row colors after being cleared', () => {
+    const spy = jest.spyOn(colors, 'resolveColor');
+
+    spy.mockReturnValue('#111111');
+    clearRowColorCache();
+    expect(firstColor()).toBe('#111111');
+
+    // Same token, new theme: without clearing, the cache pins the old color.
+    spy.mockReturnValue('#222222');
+    expect(firstColor()).toBe('#111111');
+
+    clearRowColorCache();
+    expect(firstColor()).toBe('#222222');
+
+    spy.mockRestore();
+    clearRowColorCache();
   });
 });
