@@ -388,6 +388,52 @@ describe('TradingViewChart drag viewport handling', () => {
     expect(model.performResample).toHaveBeenCalledWith([36, 64], 1000);
   });
 
+  it('drops a pending zoom when a reset double-click supersedes it', async () => {
+    // The reset requests the full range (null). Replaying a buffered zoom
+    // after the guard lifts would re-aggregate at the old zoomed width and
+    // leave the chart zoomed.
+    const { container } = await renderChart();
+    const model = mockModelInstances[0] as { performResample: jest.Mock };
+    const chartContainer = container.querySelector('.dh-tvl-chart');
+    expect(chartContainer).not.toBeNull();
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(200);
+    });
+
+    // Zoom, then reset before the debounce fires.
+    mockVisibleRange = { from: 30, to: 70 };
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(50);
+    });
+    model.performResample.mockClear();
+    act(() => {
+      chartContainer?.dispatchEvent(
+        new MouseEvent('dblclick', { bubbles: true })
+      );
+    });
+    expect(model.performResample).toHaveBeenCalledWith(null, 1000);
+
+    // The reset lands and re-establishes the baseline.
+    model.performResample.mockClear();
+    mockVisibleRange = { from: 0, to: 100 };
+    emitDataUpdate({ isResetView: true });
+
+    // Reflow events during the guard must not be replayed once it lifts, or
+    // they re-aggregate the full range and the chart is no longer "reset".
+    mockVisibleRange = { from: 0, to: 400 };
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(5000);
+    });
+    expect(model.performResample).not.toHaveBeenCalled();
+  });
+
   it('still resamples when a data update lands before the zoom debounce', async () => {
     // Data updates must not move the gesture baseline, or a zoom whose
     // debounce has not fired yet is compared against its own range, no

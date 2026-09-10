@@ -1525,10 +1525,16 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
        * request a new downsample with the visible range + 50% buffer.
        */
       function processRangeChange(): void {
+        // A reset supersedes anything the user did before it, so drop pending
+        // gestures rather than replaying them once the guard lifts.
+        if (Date.now() < dblClickGuardUntil) {
+          if (debounceTimer) clearTimeout(debounceTimer);
+          return;
+        }
         // Retry rather than drop: a gesture made while the chart is settling
         // after a swap is still the user's intent, and discarding it is why a
         // zoom sometimes never reached the server.
-        if (suppressRef.current || Date.now() < dblClickGuardUntil) {
+        if (suppressRef.current) {
           if (debounceTimer) clearTimeout(debounceTimer);
           debounceTimer = setTimeout(processRangeChange, 200);
           return;
@@ -1664,6 +1670,8 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
         baselineRef.current = null;
         restoreRangeRef.current = null; // fitContent, not restore
         lastDsRangeRef.current = null; // full range
+        // Discard a gesture still waiting on its debounce; the reset wins.
+        if (debounceTimer) clearTimeout(debounceTimer);
         renderer.resetPriceScales();
         dblClickGuardUntil = Date.now() + 1500;
         updateDebugState(
