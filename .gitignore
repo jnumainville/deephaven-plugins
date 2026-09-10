@@ -57,5 +57,3 @@ snapshot-results/
 .nx/cache
 
 *.local.code-workspace
-__pycache__/
-*.py[cod]
