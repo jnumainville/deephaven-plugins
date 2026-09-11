@@ -840,3 +840,88 @@ describe('clearRowColorCache', () => {
     clearRowColorCache();
   });
 });
+
+describe('transformTableData null handling', () => {
+  // A Deephaven null is not a number. lightweight-charts only treats a MISSING
+  // value as a gap, so a null survives into the plot row and paints as a real
+  // point — production builds strip the assertion that would catch it.
+  const lineSeries: TvlSeriesConfig = {
+    id: 's1',
+    type: 'Line',
+    options: {},
+    dataMapping: { tableId: 0, columns: { time: 'T', value: 'V' } },
+  };
+
+  it('emits whitespace for a null value instead of a plotted point', () => {
+    const result = transformTableData(
+      lineSeries,
+      new Map<string, unknown[]>([
+        ['T', [1000, 2000, 3000]],
+        ['V', [10, null, 30]],
+      ])
+    ) as Array<Record<string, unknown>>;
+
+    expect(result).toHaveLength(3);
+    expect(result[1].time).toBe(2000);
+    expect('value' in result[1]).toBe(false);
+    expect(result[0].value).toBe(10);
+    expect(result[2].value).toBe(30);
+  });
+
+  it('emits whitespace for a NaN value', () => {
+    const result = transformTableData(
+      lineSeries,
+      new Map<string, unknown[]>([
+        ['T', [1000]],
+        ['V', [Number.NaN]],
+      ])
+    ) as Array<Record<string, unknown>>;
+
+    expect('value' in result[0]).toBe(false);
+  });
+
+  it('invalidates the whole bar when one OHLC field is null', () => {
+    // lightweight-charts requires all four; a partial bar is not renderable.
+    const ohlcSeries: TvlSeriesConfig = {
+      id: 's2',
+      type: 'Candlestick',
+      options: {},
+      dataMapping: {
+        tableId: 0,
+        columns: { time: 'T', open: 'O', high: 'H', low: 'L', close: 'C' },
+      },
+    };
+
+    const result = transformTableData(
+      ohlcSeries,
+      new Map<string, unknown[]>([
+        ['T', [1000, 2000]],
+        ['O', [1, null]],
+        ['H', [2, 2]],
+        ['L', [0.5, 0.5]],
+        ['C', [1.5, 1.5]],
+      ])
+    ) as Array<Record<string, unknown>>;
+
+    expect(result[0]).toEqual({
+      time: 1000,
+      open: 1,
+      high: 2,
+      low: 0.5,
+      close: 1.5,
+    });
+    expect(result[1]).toEqual({ time: 2000 });
+  });
+
+  it('keeps a zero value, which is real data', () => {
+    const result = transformTableData(
+      lineSeries,
+      new Map<string, unknown[]>([
+        ['T', [1000]],
+        ['V', [0]],
+      ])
+    ) as Array<Record<string, unknown>>;
+
+    expect(result[0].value).toBe(0);
+  });
+});

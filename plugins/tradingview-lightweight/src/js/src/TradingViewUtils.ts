@@ -14,6 +14,9 @@ import { resolveColor } from './TradingViewColors';
  */
 const rowColorCache = new Map<string, string | undefined>();
 
+/** Fields lightweight-charts plots as numbers; everything else is styling. */
+const PLOTTED_FIELDS = ['value', 'open', 'high', 'low', 'close'] as const;
+
 /** Theme tokens resolve to different concrete colors per theme. */
 export function clearRowColorCache(): void {
   rowColorCache.clear();
@@ -106,6 +109,17 @@ export function transformTableData(
           point[field] = field === 'color' ? resolveRowColor(raw) : raw;
         }
       });
+
+      // A Deephaven null is not a number, and lightweight-charts only treats
+      // a MISSING value as a gap — a null survives into the plot row and
+      // paints as a real point (production builds strip the assertion that
+      // would catch it). Drop the value fields so the row becomes whitespace,
+      // which is the honest rendering of "no data here". OHLC needs all four,
+      // so one bad field invalidates the whole bar.
+      const present = PLOTTED_FIELDS.filter(f => f in point);
+      if (present.some(f => !Number.isFinite(point[f] as number))) {
+        present.forEach(f => delete point[f]);
+      }
 
       result.push(point);
     }
