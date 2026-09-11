@@ -126,6 +126,9 @@ export function transformTableData(
   return result;
 }
 
+/** Unit of a raw numeric time value. Required: never inferred from magnitude. */
+export type TimeUnit = 'ms' | 'ns' | 's';
+
 /**
  * Convert a time value to lightweight-charts UTCTimestamp (epoch seconds,
  * fractional allowed).
@@ -136,15 +139,20 @@ export function transformTableData(
  * wall-clock time, which is ambiguous across a DST "fall back" — both
  * instants of the repeated hour would collide and one row would be dropped.
  *
- * @param value The time value (millis, nanos, Date, or string)
+ * `unit` is required because magnitude cannot distinguish the cases: any date
+ * before 2001-09-09 has fewer than 1e12 millis, and every pre-epoch value is
+ * negative, so guessing placed those thousands of years away.
+ *
+ * @param value The time value (number, Date, or string)
+ * @param unit Unit of `value` when it is a number; ignored otherwise
  */
-export function convertTime(value: unknown): number {
+export function convertTime(value: unknown, unit: TimeUnit): number {
   // Keep fractional seconds: lightweight-charts orders and spaces points by
   // this number, so truncating collapses sub-second rows onto one slot.
   if (typeof value === 'number') {
-    if (value > 1e15) return value / 1e9;
-    if (value > 1e12) return value / 1e3;
-    return value;
+    if (unit === 'ns') return value / 1e9;
+    if (unit === 's') return value;
+    return value / 1e3;
   }
   if (value instanceof Date) return value.getTime() / 1000;
   if (typeof value === 'string') {

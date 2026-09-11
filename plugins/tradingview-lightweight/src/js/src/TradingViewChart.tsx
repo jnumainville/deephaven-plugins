@@ -499,8 +499,8 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
     if (model.isAutoBinned()) {
       const meta = model.getAutoBinMeta();
       Object.values(meta).forEach(m => {
-        const startSec = convertTime(m.fullRangeNs[0]);
-        const endSec = convertTime(m.fullRangeNs[1]);
+        const startSec = convertTime(m.fullRangeNs[0], 'ns');
+        const endSec = convertTime(m.fullRangeNs[1], 'ns');
         if (startSec < dataMin) dataMin = startSec;
         if (endSec > dataMax) dataMax = endSec;
       });
@@ -978,9 +978,14 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
       }
 
       const widget = await fetch();
+      // Unmounted mid-fetch: nothing owns the widget yet, so cleanup cannot
+      // close it and its server exports would leak.
+      if (cancelled) {
+        widget.close();
+        return;
+      }
       const exported = widget.exportedObjects;
       const dataString = widget.getDataAsString();
-      if (cancelled) return;
 
       const model = new TradingViewChartModel(dh, widget);
       modelRef.current = model;
@@ -1208,7 +1213,7 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
         // coordinate — so a test can address a known data point regardless
         // of the session timezone.
         timeToCoordinateUtc: (utcSec: number) =>
-          renderer.timeToCoordinate(convertTime(utcSec)),
+          renderer.timeToCoordinate(convertTime(utcSec, 's')),
         priceToCoordinate: (seriesId: string, p: number) =>
           renderer.priceToCoordinate(seriesId, p),
         getSeriesIds: () => renderer.getSeriesIds(),

@@ -251,8 +251,8 @@ class TradingViewChartModel {
     if (this.chartType === 'yieldCurve' || this.chartType === 'options') {
       return unwrapped;
     }
-    // Standard charts: convert millis → TZ-adjusted epoch seconds
-    return convertTime(unwrapped);
+    // unwrapValue turned the DateWrapper into epoch millis.
+    return convertTime(unwrapped, 'ms');
   };
 
   constructor(dh: typeof DhType, widget: DhType.Widget) {

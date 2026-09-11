@@ -17,50 +17,54 @@ describe('convertTime', () => {
     // Display in the user's zone is handled by TimeZoneHorzScaleBehavior.
     // Shifting the data instead would make the coordinate local wall-clock
     // time, which is ambiguous across a DST fall back.
-    expect(convertTime(utcSeconds)).toBe(utcSeconds);
+    expect(convertTime(utcSeconds, 's')).toBe(utcSeconds);
   });
 
   it('maps the two instants of a DST fall-back hour to distinct values', () => {
     // 2024-11-03 in New York: 05:30Z is 01:30 EDT, 06:30Z is 01:30 EST.
     const edt = Date.UTC(2024, 10, 3, 5, 30, 0) / 1000;
     const est = Date.UTC(2024, 10, 3, 6, 30, 0) / 1000;
-    expect(convertTime(edt * 1000)).not.toBe(convertTime(est * 1000));
-    expect(convertTime(est * 1000) - convertTime(edt * 1000)).toBe(3600);
+    expect(convertTime(edt * 1000, 'ms')).not.toBe(
+      convertTime(est * 1000, 'ms')
+    );
+    expect(convertTime(est * 1000, 'ms') - convertTime(edt * 1000, 'ms')).toBe(
+      3600
+    );
   });
 
   it('should convert milliseconds to seconds', () => {
-    expect(convertTime(utcSeconds * 1000)).toBe(utcSeconds);
+    expect(convertTime(utcSeconds * 1000, 'ms')).toBe(utcSeconds);
   });
 
   it('should convert nanoseconds to seconds', () => {
-    expect(convertTime(utcSeconds * 1e9)).toBe(utcSeconds);
+    expect(convertTime(utcSeconds * 1e9, 'ns')).toBe(utcSeconds);
   });
 
   it('should handle a Date object', () => {
     const date = new Date('2024-01-01T00:00:00Z');
-    const result = convertTime(date);
+    const result = convertTime(date, 'ms');
     expect(result).toBe(utcSeconds);
   });
 
   it('should handle a string timestamp', () => {
-    const result = convertTime('2024-01-01T00:00:00Z');
+    const result = convertTime('2024-01-01T00:00:00Z', 'ms');
     expect(result).toBe(utcSeconds);
   });
 
   it('should return 0 for null/undefined', () => {
-    expect(convertTime(null)).toBe(0);
-    expect(convertTime(undefined)).toBe(0);
+    expect(convertTime(null, 'ms')).toBe(0);
+    expect(convertTime(undefined, 'ms')).toBe(0);
   });
 
   it('should return 0 for unsupported types like boolean', () => {
-    expect(convertTime(true)).toBe(0);
+    expect(convertTime(true, 'ms')).toBe(0);
   });
 
   it('should produce consistent results for same instant in different formats', () => {
-    const fromSeconds = convertTime(utcSeconds);
-    const fromMillis = convertTime(utcSeconds * 1000);
-    const fromNanos = convertTime(utcSeconds * 1e9);
-    const fromDate = convertTime(new Date('2024-01-01T00:00:00Z'));
+    const fromSeconds = convertTime(utcSeconds, 's');
+    const fromMillis = convertTime(utcSeconds * 1000, 'ms');
+    const fromNanos = convertTime(utcSeconds * 1e9, 'ns');
+    const fromDate = convertTime(new Date('2024-01-01T00:00:00Z'), 'ms');
     expect(fromSeconds).toBe(fromMillis);
     expect(fromMillis).toBe(fromNanos);
     expect(fromNanos).toBe(fromDate);
@@ -68,8 +72,8 @@ describe('convertTime', () => {
 
   it('should use cached formatter for same timezone (performance)', () => {
     // Call twice with same timezone — second call should be fast (cached)
-    const r1 = convertTime(utcSeconds);
-    const r2 = convertTime(utcSeconds + 86400);
+    const r1 = convertTime(utcSeconds, 's');
+    const r2 = convertTime(utcSeconds + 86400, 's');
     // Both should produce valid results (not testing speed, just correctness)
     expect(typeof r1).toBe('number');
     expect(typeof r2).toBe('number');
@@ -928,7 +932,7 @@ describe('sub-second timestamps', () => {
     // collapsed every row inside one second onto a single chart slot, so only
     // the last survived deduplication.
     const ms = 1704067200123;
-    expect(convertTime(ms)).toBeCloseTo(1704067200.123, 6);
+    expect(convertTime(ms, 'ms')).toBeCloseTo(1704067200.123, 6);
   });
 
   it('keeps rows within one second distinct end to end', () => {
@@ -939,7 +943,7 @@ describe('sub-second timestamps', () => {
       dataMapping: { tableId: 0, columns: { time: 'T', value: 'V' } },
     };
     const times = [0, 50, 100, 150].map(msOffset =>
-      convertTime(1704067200000 + msOffset)
+      convertTime(1704067200000 + msOffset, 'ms')
     );
 
     const points = transformTableData(
@@ -952,5 +956,30 @@ describe('sub-second timestamps', () => {
 
     expect(new Set(points.map(p => p.time)).size).toBe(4);
     expect(deduplicateByTime(points)).toHaveLength(4);
+  });
+});
+
+describe('convertTime unit handling', () => {
+  // Magnitude inference misread anything under 1e12 ms as already-seconds,
+  // which is every date before 2001-09-09, and every pre-epoch value (those
+  // are negative). Both plotted thousands of years from where they belong.
+  it('converts a pre-2001 date correctly', () => {
+    const ms = Date.UTC(1999, 11, 31, 0, 0, 0); // 946598400000 < 1e12
+    expect(convertTime(ms, 'ms')).toBe(ms / 1000);
+    expect(new Date(convertTime(ms, 'ms') * 1000).getUTCFullYear()).toBe(1999);
+  });
+
+  it('converts a pre-epoch date correctly', () => {
+    const ms = Date.UTC(1965, 0, 1, 0, 0, 0); // negative
+    expect(ms).toBeLessThan(0);
+    expect(convertTime(ms, 'ms')).toBe(ms / 1000);
+    expect(new Date(convertTime(ms, 'ms') * 1000).getUTCFullYear()).toBe(1965);
+  });
+
+  it('treats the same number differently per unit', () => {
+    const n = 1704067200000;
+    expect(convertTime(n, 's')).toBe(n);
+    expect(convertTime(n, 'ms')).toBe(n / 1e3);
+    expect(convertTime(n, 'ns')).toBe(n / 1e9);
   });
 });

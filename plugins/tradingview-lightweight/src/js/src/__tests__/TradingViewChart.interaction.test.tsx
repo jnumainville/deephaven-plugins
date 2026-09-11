@@ -674,3 +674,38 @@ describe('TradingViewChart drag viewport handling', () => {
     expect(renderer.fitContent).not.toHaveBeenCalled();
   });
 });
+
+describe('TradingViewChart unmount during fetch', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('closes the widget when unmounted before fetch resolves', async () => {
+    const widget = { ...makeWidget(), close: jest.fn() };
+    let resolveFetch: (w: unknown) => void = () => undefined;
+    const fetchPromise = new Promise(resolve => {
+      resolveFetch = resolve;
+    });
+    const { fetch, metadata } = {
+      fetch: () => fetchPromise,
+      metadata: {},
+    } as unknown as React.ComponentProps<typeof TradingViewChart>;
+
+    const modelsBefore = mockModelInstances.length;
+    const { unmount } = render(
+      <TradingViewChart fetch={fetch} metadata={metadata} />
+    );
+    unmount();
+
+    // Widget arrives after unmount: no model owns it, so the effect cleanup
+    // cannot close it. The fetch path has to do so itself.
+    await act(async () => {
+      resolveFetch(widget);
+      await fetchPromise;
+      await Promise.resolve();
+    });
+
+    expect(widget.close).toHaveBeenCalled();
+    expect(mockModelInstances).toHaveLength(modelsBefore);
+  });
+});
