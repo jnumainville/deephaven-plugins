@@ -10,7 +10,7 @@ from deephaven.plot import tradingview_lightweight as tvl
 # Simple candlestick chart
 chart = tvl.candlestick(
     ohlc_table,
-    time="Timestamp",
+    timestamp="Timestamp",
     open="Open",
     high="High",
     low="Low",
@@ -34,8 +34,8 @@ chart = tvl.chart(
         color="#2962FF",
         title="SMA 20",
     ),
-    crosshair_mode="magnet",
-    time_visible=True,
+    crosshair=tvl.crosshair(mode="magnet"),
+    time_scale=tvl.time_scale(time_visible=True),
 )
 ```
 
@@ -48,7 +48,7 @@ from the Python docstrings.
 
 ### Build the docs locally
 
-From the repo root:
+From this plugin's directory (`plugins/tradingview-lightweight/`):
 
 ```shell
 pip install -r ../../sphinx_ext/sphinx-requirements.txt

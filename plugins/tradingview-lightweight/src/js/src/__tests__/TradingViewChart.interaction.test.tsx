@@ -210,6 +210,8 @@ jest.mock('../TradingViewChartModel', () => ({
       getEnabledHandlers: jest.fn(() => []),
       performResample: jest.fn(),
       performAutoBin: jest.fn(),
+      pendingDownsample: false,
+      pendingAutoBin: false,
     };
     mockModelInstances.push(model);
     return model;
@@ -386,6 +388,91 @@ describe('TradingViewChart drag viewport handling', () => {
       jest.advanceTimersByTime(1000);
     });
     expect(model.performResample).toHaveBeenCalledWith([36, 64], 1000);
+  });
+
+  it('shows the downsample indicator from the gesture, not the request', async () => {
+    // The request is a 200ms debounce away and the chart repaints the old
+    // coarse data immediately, so waiting for it leaves a visible window with
+    // no indication anything is happening.
+    const { container } = await renderChart();
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(200);
+    });
+
+    mockVisibleRange = { from: 30, to: 70 };
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+    });
+
+    // Before the debounce has fired, the scrim is already scheduled.
+    act(() => {
+      jest.advanceTimersByTime(200);
+    });
+    expect(container.querySelector('.tvl-pending-scrim')).not.toBeNull();
+  });
+
+  it('does not strand the indicator when a gesture sends no request', async () => {
+    const { container } = await renderChart();
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(200);
+    });
+
+    // A gesture that resolves back to the baseline range requests nothing.
+    mockVisibleRange = { from: 30, to: 70 };
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+    });
+    mockVisibleRange = { from: 0, to: 100 };
+    act(() => {
+      jest.advanceTimersByTime(2000);
+    });
+
+    expect(container.querySelector('.tvl-pending-scrim')).toBeNull();
+  });
+
+  it('resamples when zooming back out to the original range', async () => {
+    // The gesture baseline stays where it started, so the return trip reads as
+    // "no change" and no request goes out — leaving the narrow body from the
+    // zoom-in stretched across the full view with straight coarse edges.
+    await renderChart();
+    const model = mockModelInstances[0] as { performResample: jest.Mock };
+
+    act(() => {
+      jest.advanceTimersByTime(1000);
+    });
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(200);
+    });
+
+    // Zoom in: requests a narrow window.
+    mockVisibleRange = { from: 40, to: 60 };
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(1000);
+    });
+    expect(model.performResample).toHaveBeenCalledWith([36, 64], 1000);
+
+    // Zoom back out to exactly where we started. The loaded data only covers
+    // 36..64, so this must request again.
+    model.performResample.mockClear();
+    mockVisibleRange = { from: 0, to: 100 };
+    act(() => {
+      mockVisibleRangeHandlers.forEach(handler => handler());
+      jest.advanceTimersByTime(1000);
+    });
+
+    expect(model.performResample).toHaveBeenCalledWith([-20, 120], 1000);
   });
 
   it('drops a pending zoom when a reset double-click supersedes it', async () => {

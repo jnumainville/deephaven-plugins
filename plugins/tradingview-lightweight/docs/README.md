@@ -33,7 +33,7 @@ chart = tvl.chart(
 - **Live Table Support**: Direct integration with real-time Deephaven tables, so charts update as the underlying data ticks.
 - **Viewport-Aware Downsampling**: Pixel-accurate, whitespace-based downsampling that keeps panning and zooming smooth on multi-million-row series.
 - **Server-Side Autobinning**: Histograms compute bin widths and counts directly in the Deephaven query engine, avoiding round-trips of raw data.
-- **Multi-Pane Stacks**: Price, volume, and indicator series can be stacked into separate panes with independent height ratios via `pane_index`.
+- **Multi-Pane Stacks**: Price, volume, and indicator series can be stacked into separate panes with independent height ratios via `pane`.
 - **Multiple Price Scales**: Left, right, and overlay price scales, with per-scale tick mark density and a configurable default scale for unbound series.
 - **Annotations**: First-class support for watermarks, price lines, and markers, including `markers_from_table` for table-driven annotation streams.
 
@@ -57,7 +57,7 @@ chart = tvl.chart(
 
 The documentation for Deephaven TradingView Lightweight Charts routinely uses some common terms to help clarify how charts are intended to be composed:
 
-- **Pane**: A horizontally stretched section of the chart that shares the same time scale as every other pane but has its own price scale. A common layout is a price pane on top and a volume pane below; `pane_index` selects which pane a series renders into.
+- **Pane**: A horizontally stretched section of the chart that shares the same time scale as every other pane but has its own price scale. A common layout is a price pane on top and a volume pane below; `pane` selects which pane a series renders into.
 - **Series**: A single drawn element on the chart: a candlestick, line, area, bar, baseline, or histogram series. A chart can contain many series across one or more panes.
 - **Price scale**: The vertical axis a series is drawn against. Each pane has a left and right price scale, plus optional overlay scales identified by `price_scale_id`.
 - **Price line**: A horizontal line drawn at a specific price level, optionally labeled. Useful for marking last close, breakeven, stop-loss, etc.

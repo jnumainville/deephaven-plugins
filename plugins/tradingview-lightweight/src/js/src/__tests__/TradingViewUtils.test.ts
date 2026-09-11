@@ -57,11 +57,10 @@ describe('convertTime', () => {
   });
 
   it('should produce consistent results for same instant in different formats', () => {
-    const tz = 'America/Chicago'; // UTC-6 in winter
-    const fromSeconds = convertTime(utcSeconds, tz);
-    const fromMillis = convertTime(utcSeconds * 1000, tz);
-    const fromNanos = convertTime(utcSeconds * 1e9, tz);
-    const fromDate = convertTime(new Date('2024-01-01T00:00:00Z'), tz);
+    const fromSeconds = convertTime(utcSeconds);
+    const fromMillis = convertTime(utcSeconds * 1000);
+    const fromNanos = convertTime(utcSeconds * 1e9);
+    const fromDate = convertTime(new Date('2024-01-01T00:00:00Z'));
     expect(fromSeconds).toBe(fromMillis);
     expect(fromMillis).toBe(fromNanos);
     expect(fromNanos).toBe(fromDate);

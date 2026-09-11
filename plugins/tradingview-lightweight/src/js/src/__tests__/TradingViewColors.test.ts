@@ -42,18 +42,35 @@ describe('resolveColorsDeep', () => {
       layout: { textColor: 'seafoam-500' },
       lines: [{ color: '#fff' }, { color: 'accent-300' }],
     };
-    resolveColorsDeep(opts);
-    expect(opts.layout.textColor).not.toBe('seafoam-500');
-    expect(opts.lines[0].color).toBe('#fff');
-    expect(opts.lines[1].color).not.toBe('accent-300');
+    const resolved = resolveColorsDeep(opts);
+    expect(resolved.layout.textColor).not.toBe('seafoam-500');
+    expect(resolved.lines[0].color).toBe('#fff');
+    expect(resolved.lines[1].color).not.toBe('accent-300');
   });
 
   it('treats every entry in a string[] as a color (e.g. colorway)', () => {
     const palette: string[] = ['#1f77b4', 'seafoam-500', 'transparent'];
-    resolveColorsDeep(palette);
-    expect(palette[0]).toBe('#1f77b4');
-    expect(palette[1]).not.toBe('seafoam-500');
-    expect(palette[2]).toBe('transparent');
+    const resolved = resolveColorsDeep(palette);
+    expect(resolved[0]).toBe('#1f77b4');
+    expect(resolved[1]).not.toBe('seafoam-500');
+    expect(resolved[2]).toBe('transparent');
+  });
+
+  it('leaves the input untouched so tokens survive a theme change', () => {
+    // The caller's object is the model's source of truth. Overwriting a token
+    // with the color it resolved to leaves nothing to re-resolve when the
+    // theme switches.
+    const opts = {
+      layout: { textColor: 'seafoam-500' },
+      lines: [{ color: 'accent-300' }],
+      colorway: ['seafoam-500'],
+    };
+    const resolved = resolveColorsDeep(opts);
+
+    expect(opts.layout.textColor).toBe('seafoam-500');
+    expect(opts.lines[0].color).toBe('accent-300');
+    expect(opts.colorway[0]).toBe('seafoam-500');
+    expect(resolved).not.toBe(opts);
   });
 
   it('leaves non-color keys alone', () => {
@@ -61,5 +78,20 @@ describe('resolveColorsDeep', () => {
     resolveColorsDeep(opts);
     expect(opts.title).toBe('seafoam-500');
     expect(opts.count).toBe(5);
+  });
+});
+
+describe('theme change re-resolution', () => {
+  it('still sees the token on a second pass', () => {
+    // configureSeries() used to resolve in place, so a theme change re-read
+    // the old theme's concrete color and had no token left to re-resolve.
+    const cfgOptions = { color: 'seafoam-500' };
+
+    const first = resolveColorsDeep(cfgOptions);
+    const second = resolveColorsDeep(cfgOptions);
+
+    expect(cfgOptions.color).toBe('seafoam-500');
+    expect(second.color).toBe(first.color);
+    expect(second).not.toBe(first);
   });
 });

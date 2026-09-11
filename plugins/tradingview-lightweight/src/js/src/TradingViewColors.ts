@@ -37,45 +37,44 @@ export function resolveColor(value: string | undefined): string | undefined {
 }
 
 /**
- * Walk an options object and resolve every string value whose key matches a
- * color-like name in place. Handles arrays, nested objects, and the
- * `colorway: string[]` palette shape. Mutates the input.
+ * Resolve every string value whose key matches a color-like name, returning a
+ * copy. Handles arrays, nested objects, and the `colorway: string[]` palette
+ * shape.
  *
  * This lets users pass DH theme names anywhere lightweight-charts accepts a
  * color (series colors, layout/grid/crosshair, watermark, price lines, etc.)
  * without us having to enumerate the dozens of color keys in the LWC option
  * tree.
+ *
+ * Returns a copy rather than mutating: the caller's object is the model's
+ * source of truth, and overwriting a theme token with the concrete color it
+ * resolved to leaves nothing to re-resolve on a theme change.
  */
 export function resolveColorsDeep<T>(obj: T): T {
   if (obj == null || typeof obj !== 'object') return obj;
-  walk(obj as Record<string, unknown>);
-  return obj;
+  return walk(obj) as T;
 }
 
-function walk(node: unknown): void {
-  if (node == null || typeof node !== 'object') return;
+function walk(node: unknown): unknown {
+  if (node == null || typeof node !== 'object') return node;
 
   if (Array.isArray(node)) {
-    const arr = node;
-    for (let i = 0; i < arr.length; i += 1) {
-      const v = arr[i];
-      if (typeof v === 'string') {
-        // Bare string arrays (e.g. a colorway palette) — assume they're colors.
-        // No-op for non-color strings since resolveColor passes them through.
-        arr[i] = resolveColor(v);
-      } else {
-        walk(v);
-      }
-    }
-    return;
+    return node.map(v =>
+      // Bare string arrays (e.g. a colorway palette) — assume they're colors.
+      // No-op for non-color strings since resolveColor passes them through.
+      typeof v === 'string' ? resolveColor(v) : walk(v)
+    );
   }
 
-  const record = node as Record<string, unknown>;
-  Object.entries(record).forEach(([key, val]) => {
+  const out: Record<string, unknown> = {};
+  Object.entries(node as Record<string, unknown>).forEach(([key, val]) => {
     if (typeof val === 'string' && COLOR_KEY_RE.test(key)) {
-      record[key] = resolveColor(val);
+      out[key] = resolveColor(val);
     } else if (val != null && typeof val === 'object') {
-      walk(val);
+      out[key] = walk(val);
+    } else {
+      out[key] = val;
     }
   });
+  return out;
 }

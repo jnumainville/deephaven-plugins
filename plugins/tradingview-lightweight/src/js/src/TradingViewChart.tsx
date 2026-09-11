@@ -1020,14 +1020,15 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
             break;
           case 'DATA_UPDATED':
             if (event.isInitialLoad) setIsLoading(false);
-            // Only the swap (or a reset) resolves a pending resample. Clearing
-            // on any update let a routine tick cancel the indicator, leaving
-            // the old coarse data on screen with nothing showing.
+            // Reflect what is actually in flight. A chart with both a
+            // downsampled and an auto-binned table resolves them separately,
+            // so clearing on the first swap flashed the indicator off and
+            // back on when the second request landed.
             if (
               !event.isInitialLoad &&
               (event.isDownsampleSwap === true || event.isResetView === true)
             ) {
-              setPendingDs(false);
+              setPendingDs(model.pendingDownsample || model.pendingAutoBin);
             }
             handleDataUpdate(renderer, model, event);
             updateDebugState(
@@ -1041,11 +1042,9 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
             );
             break;
           case 'DOWNSAMPLE_PENDING':
-            if (event.pending) {
-              setPendingDs(true);
-            } else {
-              setPendingDs(false);
-            }
+            setPendingDs(
+              event.pending || model.pendingDownsample || model.pendingAutoBin
+            );
             // Refresh data-tvl-state so consumers (Playwright) see the
             // up-to-date pendingDs without waiting for a DATA_UPDATED.
             if (containerRef.current) {
@@ -1535,10 +1534,17 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
        * request a new downsample with the visible range + 50% buffer.
        */
       function processRangeChange(): void {
+        // The indicator is raised optimistically on the gesture, so every path
+        // that ends without a request has to lower it again.
+        const abort = (): void => {
+          setPendingDs(model.pendingDownsample || model.pendingAutoBin);
+        };
+
         // A reset supersedes anything the user did before it, so drop pending
         // gestures rather than replaying them once the guard lifts.
         if (Date.now() < dblClickGuardUntil) {
           if (debounceTimer) clearTimeout(debounceTimer);
+          abort();
           return;
         }
         // Retry rather than drop: a gesture made while the chart is settling
@@ -1551,19 +1557,35 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
         }
 
         const vr = timeScale.getVisibleRange();
-        if (vr == null) return;
+        if (vr == null) {
+          abort();
+          return;
+        }
         const visFrom = Number(vr.from);
         const visTo = Number(vr.to);
         const visDur = visTo - visFrom;
-        if (visDur < 1) return;
+        if (visDur < 1) {
+          abort();
+          return;
+        }
 
         // Capture baseline on first event
         if (baselineRef.current == null) {
           baselineRef.current = { from: visFrom, to: visTo };
+          abort();
           return;
         }
 
-        const isZoom = detectGesture(visFrom, visTo);
+        // The baseline tracks gestures, but what matters is whether the
+        // loaded data covers the view. Zooming in and back out leaves the
+        // baseline where it started, so the return trip reads as "no change"
+        // and the chart keeps the narrow body from the zoom-in. null means the
+        // last request was full-range and covers everything.
+        const lastDs = lastDsRangeRef.current;
+        const uncovered =
+          lastDs != null && (visFrom < lastDs[0] || visTo > lastDs[1]);
+        const isZoom = detectGesture(visFrom, visTo) || uncovered;
+        if (!isZoom) abort();
         if (isZoom) {
           // Already claimed synchronously in the range-change handler; this
           // re-assert covers the direct call from the drag-end path.
@@ -1651,6 +1673,10 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
             if (detectGesture(visFrom, visTo)) {
               userInteractedRef.current = true;
               restoreRangeRef.current = { from: visFrom, to: visTo };
+              // Show the indicator from the gesture, not from the request:
+              // the request is 200ms of debounce away and the chart is
+              // already repainting the old coarse data in the meantime.
+              if (model.isResampling()) setPendingDs(true);
             }
           }
         } catch {

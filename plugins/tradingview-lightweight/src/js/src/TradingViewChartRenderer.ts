@@ -692,13 +692,15 @@ class TradingViewChartRenderer {
   ): void {
     // Resolve any DH theme color names in user-supplied options up front so
     // canvas drawing calls receive concrete CSS color strings (hex/rgba).
-    seriesConfigs.forEach(cfg => {
-      resolveColorsDeep(cfg.options);
-      const { priceLines } = cfg;
-      priceLines?.forEach((pl, i) => {
-        if (pl.color != null) priceLines[i].color = resolveColor(pl.color);
-      });
-    });
+    // Work on copies: these configs belong to the model and are re-used on a
+    // theme change, so the original tokens have to survive to be re-resolved.
+    const resolvedConfigs = seriesConfigs.map(cfg => ({
+      ...cfg,
+      options: resolveColorsDeep(cfg.options),
+      priceLines: cfg.priceLines?.map(pl =>
+        pl.color != null ? { ...pl, color: resolveColor(pl.color) } : pl
+      ),
+    }));
     const colorway = colorwayInput.map(c => resolveColor(c) ?? c);
     const ohlcColors =
       ohlcColorsInput != null
@@ -754,7 +756,7 @@ class TradingViewChartRenderer {
     // template into one runtime series per partition key (with a
     // synthesized id) and pushes those into figureData.series.
     let colorIndex = 0;
-    seriesConfigs.forEach(config => {
+    resolvedConfigs.forEach(config => {
       if (config.partition != null) {
         return;
       }
