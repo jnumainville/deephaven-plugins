@@ -252,7 +252,7 @@ class TradingViewChartModel {
       return unwrapped;
     }
     // Standard charts: convert millis → TZ-adjusted epoch seconds
-    return convertTime(unwrapped, this.timeZone);
+    return convertTime(unwrapped);
   };
 
   constructor(dh: typeof DhType, widget: DhType.Widget) {
@@ -287,33 +287,10 @@ class TradingViewChartModel {
    * on a timezone change rather than tearing the whole chart down.
    */
   setTimeZone(tz: string): void {
-    const next = tz ?? '';
-    if (next === this.timeZone) return;
-    this.timeZone = next;
-    if (this.tableSubscriptionMap.size === 0) return;
-    this.resubscribeForTimeZone();
-  }
-
-  /**
-   * Tear down and re-create every active table subscription so time columns
-   * are re-extracted through timeTranslator using the current timezone. Each
-   * table is flagged as a fresh data swap so the view replaces (rather than
-   * appends) its series data and can re-anchor the viewport. The currently
-   * subscribed table (original, downsampled, or auto-binned) is reused, so
-   * the existing downsample / auto-bin scope is preserved across the change.
-   */
-  private resubscribeForTimeZone(): void {
-    const tableIds = Array.from(this.tableSubscriptionMap.keys());
-    tableIds.forEach(tableId => {
-      const table = this.tables.get(tableId);
-      if (!table) return;
-      // Same table is re-subscribed below, so no table release here.
-      this.retireSubscription(tableId);
-      this.chartDataMap.delete(tableId);
-      this.tableDataMap.delete(tableId);
-      this.freshDownsampleTables.add(tableId);
-      this.subscribeTable(tableId, table);
-    });
+    // Time columns are converted to UTC seconds regardless of zone, so a zone
+    // change no longer affects the data and needs no resubscribe. It is a
+    // display concern handled by TimeZoneHorzScaleBehavior.
+    this.timeZone = tz ?? '';
   }
 
   /**
@@ -594,8 +571,8 @@ class TradingViewChartModel {
     // Convert TZ-shifted seconds to DateWrapper range
     let dsRange: DhType.DateWrapper[] | undefined;
     if (range != null) {
-      const fromUtcSec = unconvertTime(range[0], this.timeZone);
-      const toUtcSec = unconvertTime(range[1], this.timeZone);
+      const fromUtcSec = unconvertTime(range[0]);
+      const toUtcSec = unconvertTime(range[1]);
       dsRange = [
         this.dh.DateWrapper.ofJsDate(new Date(fromUtcSec * 1000)),
         this.dh.DateWrapper.ofJsDate(new Date(toUtcSec * 1000)),
@@ -765,8 +742,8 @@ class TradingViewChartModel {
       }
       // Range comes in as TZ-shifted epoch seconds (matching the chart's
       // visible range). Convert to UTC nanoseconds for the server.
-      const fromUtcSec = unconvertTime(range[0], this.timeZone);
-      const toUtcSec = unconvertTime(range[1], this.timeZone);
+      const fromUtcSec = unconvertTime(range[0]);
+      const toUtcSec = unconvertTime(range[1]);
       const fromNs = Math.floor(fromUtcSec * 1e9);
       const toNs = Math.floor(toUtcSec * 1e9);
       // atLiveEdge: visible range's right edge is at or past the source's

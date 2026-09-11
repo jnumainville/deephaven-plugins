@@ -239,17 +239,16 @@ describe('buildPressEventPayload', () => {
       expect(payload.timeNs).toBe(1700000000 * 1e9);
     });
 
-    it('reverses TZ shift for a non-UTC zone', () => {
+    it('reports the same instant regardless of display zone', () => {
+      // The chart coordinate is UTC, so the zone only affects axis labels.
       const params = {
         seriesData: new Map(),
         time: 1700000000,
       } as unknown as MouseEventParams;
       const ny = buildPayload('press', params, resolver0(), 'America/New_York');
       const utc = buildPayload('press', params, resolver0(), 'UTC');
-      const expectedDiffSec = 5 * 3600; // NY is UTC-5 in winter
-      expect((utc.timeNs as number) - (ny.timeNs as number)).toBe(
-        -expectedDiffSec * 1e9
-      );
+      expect(ny.timeNs).toBe(utc.timeNs);
+      expect(utc.timeNs).toBe(1700000000 * 1e9);
     });
 
     it('omits timeNs when time is undefined (outside data range)', () => {

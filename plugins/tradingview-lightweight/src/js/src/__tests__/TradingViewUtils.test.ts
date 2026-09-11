@@ -3,6 +3,7 @@ import * as colors from '../TradingViewColors';
 import {
   convertTime,
   transformTableData,
+  deduplicateByTime,
   getRequiredColumns,
   getAllColumnsForTable,
   buildMarkersFromTableData,
@@ -12,44 +13,37 @@ import {
 describe('convertTime', () => {
   const utcSeconds = 1704067200; // 2024-01-01T00:00:00Z
 
-  it('should apply explicit timezone offset for America/New_York', () => {
-    // 2024-01-01 is EST (UTC-5), so offset = -5 * 3600 = -18000
-    const result = convertTime(utcSeconds, 'America/New_York');
-    expect(result).toBe(utcSeconds - 5 * 3600);
+  it('keeps the chart coordinate in UTC, unshifted by any zone', () => {
+    // Display in the user's zone is handled by TimeZoneHorzScaleBehavior.
+    // Shifting the data instead would make the coordinate local wall-clock
+    // time, which is ambiguous across a DST fall back.
+    expect(convertTime(utcSeconds)).toBe(utcSeconds);
   });
 
-  it('should apply explicit timezone offset for Asia/Tokyo', () => {
-    // Tokyo is UTC+9, so offset = +9 * 3600
-    const result = convertTime(utcSeconds, 'Asia/Tokyo');
-    expect(result).toBe(utcSeconds + 9 * 3600);
+  it('maps the two instants of a DST fall-back hour to distinct values', () => {
+    // 2024-11-03 in New York: 05:30Z is 01:30 EDT, 06:30Z is 01:30 EST.
+    const edt = Date.UTC(2024, 10, 3, 5, 30, 0) / 1000;
+    const est = Date.UTC(2024, 10, 3, 6, 30, 0) / 1000;
+    expect(convertTime(edt * 1000)).not.toBe(convertTime(est * 1000));
+    expect(convertTime(est * 1000) - convertTime(edt * 1000)).toBe(3600);
   });
 
-  it('should fall back to browser local timezone when no timezone provided', () => {
-    const offsetSeconds = -(
-      new Date(utcSeconds * 1000).getTimezoneOffset() * 60
-    );
-    const expected = utcSeconds + offsetSeconds;
-    expect(convertTime(utcSeconds)).toBe(expected);
+  it('should convert milliseconds to seconds', () => {
+    expect(convertTime(utcSeconds * 1000)).toBe(utcSeconds);
   });
 
-  it('should convert milliseconds to offset-adjusted seconds', () => {
-    const result = convertTime(utcSeconds * 1000, 'UTC');
-    expect(result).toBe(utcSeconds); // UTC offset is 0
-  });
-
-  it('should convert nanoseconds to offset-adjusted seconds', () => {
-    const result = convertTime(utcSeconds * 1e9, 'UTC');
-    expect(result).toBe(utcSeconds);
+  it('should convert nanoseconds to seconds', () => {
+    expect(convertTime(utcSeconds * 1e9)).toBe(utcSeconds);
   });
 
   it('should handle a Date object', () => {
     const date = new Date('2024-01-01T00:00:00Z');
-    const result = convertTime(date, 'UTC');
+    const result = convertTime(date);
     expect(result).toBe(utcSeconds);
   });
 
   it('should handle a string timestamp', () => {
-    const result = convertTime('2024-01-01T00:00:00Z', 'UTC');
+    const result = convertTime('2024-01-01T00:00:00Z');
     expect(result).toBe(utcSeconds);
   });
 
@@ -75,8 +69,8 @@ describe('convertTime', () => {
 
   it('should use cached formatter for same timezone (performance)', () => {
     // Call twice with same timezone — second call should be fast (cached)
-    const r1 = convertTime(utcSeconds, 'Europe/London');
-    const r2 = convertTime(utcSeconds + 86400, 'Europe/London');
+    const r1 = convertTime(utcSeconds);
+    const r2 = convertTime(utcSeconds + 86400);
     // Both should produce valid results (not testing speed, just correctness)
     expect(typeof r1).toBe('number');
     expect(typeof r2).toBe('number');
@@ -294,14 +288,17 @@ describe('transformTableData', () => {
       expect(result).toEqual([{ time: 1704067200, value: 42 }]);
     });
 
-    it('should floor fractional seconds', () => {
+    it('should preserve fractional seconds', () => {
+      // lightweight-charts orders and spaces points by this number and keeps
+      // fractional values distinct, so truncating would collapse sub-second
+      // rows onto a single slot.
       const columnData = new Map<string, unknown[]>([
         ['Timestamp', [1704067200.999]],
         ['Val', [42]],
       ]);
 
       const result = transformTableData(config, columnData);
-      expect(result).toEqual([{ time: 1704067200, value: 42 }]);
+      expect(result).toEqual([{ time: 1704067200.999, value: 42 }]);
     });
 
     it('should skip rows with non-numeric time values', () => {
@@ -923,5 +920,38 @@ describe('transformTableData null handling', () => {
     ) as Array<Record<string, unknown>>;
 
     expect(result[0].value).toBe(0);
+  });
+});
+
+describe('sub-second timestamps', () => {
+  it('keeps millisecond precision through convertTime', () => {
+    // Deephaven Instants arrive as epoch millis. Truncating to whole seconds
+    // collapsed every row inside one second onto a single chart slot, so only
+    // the last survived deduplication.
+    const ms = 1704067200123;
+    expect(convertTime(ms)).toBeCloseTo(1704067200.123, 6);
+  });
+
+  it('keeps rows within one second distinct end to end', () => {
+    const series: TvlSeriesConfig = {
+      id: 's1',
+      type: 'Line',
+      options: {},
+      dataMapping: { tableId: 0, columns: { time: 'T', value: 'V' } },
+    };
+    const times = [0, 50, 100, 150].map(msOffset =>
+      convertTime(1704067200000 + msOffset)
+    );
+
+    const points = transformTableData(
+      series,
+      new Map<string, unknown[]>([
+        ['T', times],
+        ['V', [1, 2, 3, 4]],
+      ])
+    ) as Array<Record<string, unknown>>;
+
+    expect(new Set(points.map(p => p.time)).size).toBe(4);
+    expect(deduplicateByTime(points)).toHaveLength(4);
   });
 });

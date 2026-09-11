@@ -249,6 +249,51 @@ async function initModelWithAutoBin(autoBin: boolean): Promise<{
   return { model, widget, table };
 }
 
+/**
+ * Model whose table is large enough to downsample, so performDownsample()
+ * retires the original subscription and installs a replacement. That is the
+ * real production path that exercises deferred retirement.
+ */
+async function initModelForRetirement(): Promise<{
+  model: TradingViewChartModel;
+  widget: ReturnType<typeof makeMockWidget>;
+  table: MockTable;
+  downsampled: MockTable;
+}> {
+  const dh = makeMockDh();
+  const widget = makeMockWidget();
+  const model = new TradingViewChartModel(dh, widget as never);
+
+  const figure = makeFigure(false);
+  figure.downsampleMeta = {
+    '0': {
+      tableSize: 10_000_000,
+      timeCol: 'Timestamp',
+      valueCols: ['Value'],
+      seriesTypes: ['Line'],
+    },
+  };
+
+  const downsampled = new MockTable(250);
+  const runDownsample = runDownsampleMock(dh);
+  runDownsample.mockResolvedValue(downsampled);
+
+  const table = new MockTable(10_000_000);
+  model.setTimeZone('UTC');
+  await model.init(
+    [{ fetch: jest.fn().mockResolvedValue(table) } as never],
+    JSON.stringify({
+      type: 'NEW_FIGURE',
+      figure,
+      revision: 1,
+      new_references: [0],
+      removed_references: [],
+    })
+  );
+
+  return { model, widget, table, downsampled };
+}
+
 describe('TradingViewChartModel auto-bin', () => {
   describe('autoBinMeta detection', () => {
     it('marks the model as auto-binned when figure.autoBinMeta is present', async () => {
@@ -706,22 +751,19 @@ describe('TradingViewChartModel partition downsampling', () => {
 });
 
 describe('TradingViewChartModel timezone changes', () => {
-  it('re-subscribes active tables when the timezone changes after init', async () => {
+  it('does not re-subscribe when the timezone changes', async () => {
+    // Time columns convert to UTC seconds regardless of zone, so a zone change
+    // cannot affect the data. Re-subscribing would drop and refetch every
+    // table, which showed up as a flicker back to coarse downsampled data.
     const { model, table } = await initModelWithAutoBin(false);
-    // init subscribed exactly once
     expect(table.subscribe).toHaveBeenCalledTimes(1);
     const firstSub = table.subscribe.mock.results[0].value;
-    // Deliver the initial snapshot so the old subscription can be released
-    // immediately (an undelivered one is retired lazily — see the
-    // deferred-retirement tests).
     deliverUpdate(firstSub);
 
     model.setTimeZone('America/New_York');
 
-    // Old subscription torn down, a fresh one created so time columns
-    // re-convert through timeTranslator in the new timezone.
-    expect(firstSub.close).toHaveBeenCalledTimes(1);
-    expect(table.subscribe).toHaveBeenCalledTimes(2);
+    expect(firstSub.close).not.toHaveBeenCalled();
+    expect(table.subscribe).toHaveBeenCalledTimes(1);
     expect(model.getTimeZone()).toBe('America/New_York');
   });
 
@@ -753,7 +795,7 @@ describe('TradingViewChartModel deferred retirement', () => {
 
     // Retire before any data arrived: cancelling now would race the
     // server's in-flight snapshot, so the release must wait.
-    model.setTimeZone('America/New_York');
+    model.close();
     expect(firstSub.close).not.toHaveBeenCalled();
 
     // The snapshot lands — the retired subscription is released.
@@ -767,7 +809,7 @@ describe('TradingViewChartModel deferred retirement', () => {
       const { model, table } = await initModelWithAutoBin(false);
       const firstSub = table.subscribe.mock.results[0].value;
 
-      model.setTimeZone('America/New_York');
+      model.close();
       expect(firstSub.close).not.toHaveBeenCalled();
 
       jest.advanceTimersByTime(60000);
@@ -816,7 +858,7 @@ describe('TradingViewChartModel quiescence', () => {
   it('tracks draining retirements and emits RETIREMENT_DRAINED on settle', async () => {
     jest.useFakeTimers();
     try {
-      const { model, table } = await initModelWithAutoBin(false);
+      const { model, downsampled } = await initModelForRetirement();
       const events: string[] = [];
       model.subscribe(e => events.push(e.type));
 
@@ -825,7 +867,7 @@ describe('TradingViewChartModel quiescence', () => {
       // installed. (Settle via the backstop timer — the mock subscription
       // replays every registered listener on delivery, which would also
       // mark the replacement slot delivered and mask the next assertion.)
-      model.setTimeZone('America/New_York');
+      await model.performDownsample([0, 100], 1000);
       expect(model.isQuiescent()).toBe(false);
 
       jest.advanceTimersByTime(60000);
@@ -833,7 +875,7 @@ describe('TradingViewChartModel quiescence', () => {
       // The drain settled, but the replacement subscription has no data.
       expect(model.isQuiescent()).toBe(false);
 
-      deliverUpdate(table.subscribe.mock.results[1].value);
+      deliverUpdate(downsampled.subscribe.mock.results[0].value);
       expect(model.isQuiescent()).toBe(true);
     } finally {
       jest.useRealTimers();

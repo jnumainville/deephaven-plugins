@@ -24,7 +24,6 @@ import {
   buildMarkersFromTableData,
   clearRowColorCache,
   convertTime,
-  unconvertTime,
 } from './TradingViewUtils';
 import type {
   TvlChartType,
@@ -91,6 +90,8 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
       ? settingsTimeZone
       : Intl.DateTimeFormat().resolvedOptions().timeZone;
   const chartTheme = useDHChartTheme();
+  const timeZoneRef = useRef(timeZone);
+  timeZoneRef.current = timeZone;
   const chartThemeRef = useRef(chartTheme);
   chartThemeRef.current = chartTheme;
   const containerRef = useRef<HTMLDivElement>(null);
@@ -496,11 +497,10 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
     // Union with autobin source extents (in case the body window has
     // contracted inside fullRangeNs since the last data update).
     if (model.isAutoBinned()) {
-      const tz = model.getTimeZone();
       const meta = model.getAutoBinMeta();
       Object.values(meta).forEach(m => {
-        const startSec = convertTime(m.fullRangeNs[0], tz);
-        const endSec = convertTime(m.fullRangeNs[1], tz);
+        const startSec = convertTime(m.fullRangeNs[0]);
+        const endSec = convertTime(m.fullRangeNs[1]);
         if (startSec < dataMin) dataMin = startSec;
         if (endSec > dataMax) dataMax = endSec;
       });
@@ -1020,7 +1020,15 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
             break;
           case 'DATA_UPDATED':
             if (event.isInitialLoad) setIsLoading(false);
-            if (!event.isInitialLoad) setPendingDs(false);
+            // Only the swap (or a reset) resolves a pending resample. Clearing
+            // on any update let a routine tick cancel the indicator, leaving
+            // the old coarse data on screen with nothing showing.
+            if (
+              !event.isInitialLoad &&
+              (event.isDownsampleSwap === true || event.isResetView === true)
+            ) {
+              setPendingDs(false);
+            }
             handleDataUpdate(renderer, model, event);
             updateDebugState(
               gatherDebug(
@@ -1201,7 +1209,7 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
         // coordinate — so a test can address a known data point regardless
         // of the session timezone.
         timeToCoordinateUtc: (utcSec: number) =>
-          renderer.timeToCoordinate(convertTime(utcSec, model.getTimeZone())),
+          renderer.timeToCoordinate(convertTime(utcSec)),
         priceToCoordinate: (seriesId: string, p: number) =>
           renderer.priceToCoordinate(seriesId, p),
         getSeriesIds: () => renderer.getSeriesIds(),
@@ -1254,7 +1262,8 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
       const renderer = new TradingViewChartRenderer(
         chartHostRef.current,
         themeOptions as Record<string, unknown>,
-        ct
+        ct,
+        timeZoneRef.current
       );
       rendererRef.current = renderer;
 
@@ -1769,37 +1778,50 @@ function TradingViewChart(props: TradingViewChartProps): JSX.Element | null {
   }, [dh, fetch, fontsReady]);
 
   // Respond to client-side timezone changes without tearing down the
-  // model/renderer. The model re-subscribes its tables so time columns
-  // re-convert in the new timezone (see TradingViewChartModel.setTimeZone).
-  // If the user had zoomed/panned, re-anchor the viewport to the same
-  // wall-clock window by re-projecting the visible range through the old and
-  // new timezone shifts so the same data stays in view.
+  // model/renderer. The chart coordinate is UTC, so the data and the viewport
+  // are unaffected — only axis ticks and labels need to re-resolve.
   useEffect(() => {
     const renderer = rendererRef.current;
     const model = modelRef.current;
     if (!renderer || !model) return;
 
-    const oldTimeZone = model.getTimeZone();
-    if (oldTimeZone === timeZone) return;
+    if (model.getTimeZone() === timeZone) return;
 
-    if (userInteractedRef.current) {
-      try {
-        const vr = renderer.getChart().timeScale().getVisibleRange();
-        if (vr != null) {
-          const remap = (shifted: number): number =>
-            convertTime(unconvertTime(shifted, oldTimeZone), timeZone);
-          restoreRangeRef.current = {
-            from: remap(Number(vr.from)),
-            to: remap(Number(vr.to)),
-          };
-        }
-      } catch {
-        // chart may not be ready — fall back to fitContent on data swap
-      }
+    const chart = renderer.getChart();
+    let saved: { from: unknown; to: unknown } | null = null;
+    try {
+      saved = chart.timeScale().getVisibleRange();
+    } catch {
+      // chart may not be ready
     }
 
+    renderer.setTimeZone(timeZone);
     model.setTimeZone(timeZone);
-  }, [timeZone]);
+
+    // Tick weights are assigned as points are added, so the points must be
+    // re-fed for the new zone's day boundaries to take effect. The data is
+    // unchanged (the coordinate is UTC), so re-feed in place rather than
+    // reconfiguring series, and hold the viewport exactly where it was.
+    const figure = model.getFigureData();
+    if (figure == null) return;
+
+    applyingDataRef.current = true;
+    try {
+      renderAllSeriesData(renderer, model, figure);
+      if (shouldEnableScaffold(renderer, model)) {
+        updateScaffold(renderer, model);
+      }
+      renderer.refreshMarkers();
+      if (saved != null) {
+        chart.timeScale().setVisibleRange(saved as never);
+      }
+    } catch {
+      // chart may not be ready
+    } finally {
+      applyingDataRef.current = false;
+    }
+    markProgrammaticViewport(chart.timeScale());
+  }, [timeZone, markProgrammaticViewport]);
 
   // Apply theme changes without tearing down the model/renderer.
   useEffect(() => {

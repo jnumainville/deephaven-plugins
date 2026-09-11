@@ -79,9 +79,7 @@ export function transformTableData(
     // first real point — visible as a near-vertical "spike" entering the
     // chart from the left edge when zoomed to recent data.
     const timeVal =
-      typeof rawTime === 'number' && Number.isFinite(rawTime)
-        ? Math.floor(rawTime)
-        : null;
+      typeof rawTime === 'number' && Number.isFinite(rawTime) ? rawTime : null;
 
     // For standard (time-based) charts, time=0 is essentially always a
     // sentinel for missing data — Instant columns don't represent epoch.
@@ -129,80 +127,50 @@ export function transformTableData(
 }
 
 /**
- * Convert a time value to lightweight-charts UTCTimestamp (integer seconds).
+ * Convert a time value to lightweight-charts UTCTimestamp (epoch seconds,
+ * fractional allowed).
  *
- * Lightweight-charts has no timezone support — it renders timestamps as-is.
- * To make the axis labels match the user's Deephaven timezone setting, we
- * shift the UTC timestamp by the timezone offset. This is the standard
- * approach recommended by the TradingView community.
+ * The chart coordinate is true UTC. Display in the user's zone is handled by
+ * TimeZoneHorzScaleBehavior, which shifts only for tick weighting and label
+ * formatting. Shifting the data instead would make the coordinate local
+ * wall-clock time, which is ambiguous across a DST "fall back" — both
+ * instants of the repeated hour would collide and one row would be dropped.
  *
  * @param value The time value (millis, nanos, Date, or string)
- * @param timeZone The IANA timezone string from user settings (e.g. "America/New_York").
- *   Falls back to the browser's local timezone if not provided.
  */
-export function convertTime(value: unknown, timeZone?: string): number {
-  let utcSeconds: number;
+export function convertTime(value: unknown): number {
+  // Keep fractional seconds: lightweight-charts orders and spaces points by
+  // this number, so truncating collapses sub-second rows onto one slot.
   if (typeof value === 'number') {
-    if (value > 1e15) {
-      utcSeconds = Math.floor(value / 1e9);
-    } else if (value > 1e12) {
-      utcSeconds = Math.floor(value / 1e3);
-    } else {
-      utcSeconds = Math.floor(value);
-    }
-  } else if (value instanceof Date) {
-    utcSeconds = Math.floor(value.getTime() / 1000);
-  } else if (typeof value === 'string') {
-    const ms = new Date(value).getTime();
-    if (Number.isNaN(ms)) return 0;
-    utcSeconds = Math.floor(ms / 1000);
-  } else {
-    return 0;
+    if (value > 1e15) return value / 1e9;
+    if (value > 1e12) return value / 1e3;
+    return value;
   }
-
-  // Shift by the user's timezone offset so axis labels display in their
-  // configured timezone. Uses Intl API to resolve the offset for the
-  // specific instant (handles DST correctly).
-  const offsetSeconds = getTimezoneOffsetSeconds(utcSeconds * 1000, timeZone);
-  return utcSeconds + offsetSeconds;
+  if (value instanceof Date) return value.getTime() / 1000;
+  if (typeof value === 'string') {
+    const ms = new Date(value).getTime();
+    return Number.isNaN(ms) ? 0 : ms / 1000;
+  }
+  return 0;
 }
 
 /**
- * Reverse the TZ shift applied by convertTime. Given a TZ-shifted epoch
- * seconds value (as stored in the chart's data and returned by
- * getVisibleRange), return the real UTC epoch seconds.
- *
- * convertTime does: realUTC + offset → tzShifted
- * unconvertTime does: tzShifted - offset → realUTC
- *
- * Uses the shifted value as an approximation for the offset lookup, which
- * is correct except at DST boundaries (where the error is ≤1 hour).
+ * Inverse of convertTime. The chart coordinate is already UTC epoch seconds,
+ * so this is the identity; kept so call sites stay explicit about which side
+ * of the boundary they are on.
  */
-export function unconvertTime(
-  tzShiftedSeconds: number,
-  timeZone?: string
-): number {
-  if (
-    timeZone == null ||
-    timeZone === '' ||
-    timeZone === 'UTC' ||
-    timeZone === 'Etc/UTC'
-  ) {
-    return tzShiftedSeconds;
-  }
-  // Use the shifted value as an approximation to compute the offset
-  const offsetSeconds = getTimezoneOffsetSeconds(
-    tzShiftedSeconds * 1000,
-    timeZone
-  );
-  return tzShiftedSeconds - offsetSeconds;
+export function unconvertTime(chartSeconds: number): number {
+  return chartSeconds;
 }
 
 /**
  * Get the timezone offset in seconds for a given instant and timezone.
  * Positive = east of UTC (e.g. +9 for Tokyo), negative = west (e.g. -5 for NY).
  */
-function getTimezoneOffsetSeconds(epochMs: number, timeZone?: string): number {
+export function getTimezoneOffsetSeconds(
+  epochMs: number,
+  timeZone?: string
+): number {
   if (timeZone == null || timeZone === '') {
     // Fall back to browser local timezone
     return -(new Date(epochMs).getTimezoneOffset() * 60);

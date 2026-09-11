@@ -89,8 +89,75 @@ const HistogramSeries = 'HistogramSeries';
 
 const customSeriesDefaultOptions = {};
 
+// createChartEx takes a horzScaleBehavior; tests assert on the options object,
+// so forward to the same mock chart factory.
+const createChartEx = jest.fn((container, behavior, options) =>
+  createChart(container, options)
+);
+
+// Minimal stand-in for the real base class. Only the pieces our zone-aware
+// subclass touches are implemented; the real behavior is exercised in
+// TimeZoneHorzScaleBehavior.probe.test.ts against the actual library.
+/* eslint-disable class-methods-use-this */
+class MockHorzScaleBehavior {
+  key(item) {
+    return typeof item === 'object' && item !== null ? item.timestamp : item;
+  }
+
+  convertHorzItemToInternal(t) {
+    return { timestamp: t };
+  }
+
+  formatHorzItem(item) {
+    return String(this.key(item));
+  }
+
+  formatTickmark(tickMark) {
+    return String(this.key(tickMark.time));
+  }
+
+  maxTickMarkWeight(marks) {
+    return marks.reduce((a, b) => (b.weight > a.weight ? b : a), marks[0])
+      .weight;
+  }
+
+  fillWeightsForPoints() {
+    // no-op
+  }
+
+  options() {
+    return {};
+  }
+
+  setOptions() {
+    // no-op
+  }
+
+  preprocessData() {
+    // no-op
+  }
+
+  createConverterToInternalObj() {
+    return t => ({ timestamp: t });
+  }
+
+  cacheKey(item) {
+    return this.key(item);
+  }
+
+  updateFormatter() {
+    // no-op
+  }
+}
+
+/* eslint-enable class-methods-use-this */
+
+const defaultHorzScaleBehavior = jest.fn(() => MockHorzScaleBehavior);
+
 module.exports = {
   createChart,
+  createChartEx,
+  defaultHorzScaleBehavior,
   createYieldCurveChart,
   createOptionsChart,
   createSeriesMarkers,

@@ -1857,3 +1857,59 @@ describe('TradingViewChartRenderer', () => {
     });
   });
 });
+
+describe('business-day marker snapping', () => {
+  // Chart times are UTC. A calendar day must resolve to local midnight in the
+  // display zone, or it snaps to whichever bar is nearest UTC midnight — for a
+  // zone behind UTC that is the PREVIOUS day's bar.
+  const NY = 'America/New_York';
+  // Daily bars at 10:00 ET (15:00 UTC) in January.
+  const bars = [4, 5, 8, 9, 10].map(day => ({
+    time: Date.UTC(2024, 0, day, 15, 0, 0) / 1000,
+    open: 100,
+    high: 105,
+    low: 95,
+    close: 102,
+  }));
+
+  function appliedMarkerTime(timeZone?: string): number {
+    const renderer = new TradingViewChartRenderer(
+      document.createElement('div'),
+      {},
+      'standard',
+      timeZone
+    );
+    renderer.configureSeries([
+      {
+        id: 'c1',
+        type: 'Candlestick',
+        options: {},
+        dataMapping: { tableId: 0, columns: { time: 'T' } },
+      },
+    ]);
+    renderer.setSeriesData('c1', bars);
+    createSeriesMarkers.mockClear();
+    renderer.setSeriesMarkers('c1', [
+      {
+        time: '2024-01-10',
+        position: 'aboveBar',
+        shape: 'arrowDown',
+        text: 'Sell',
+      },
+    ]);
+    const applied = createSeriesMarkers.mock.calls[0][1] as Array<{
+      time: number;
+    }>;
+    return applied[0].time;
+  }
+
+  it('snaps a calendar day to that day’s bar in the display zone', () => {
+    expect(appliedMarkerTime(NY)).toBe(Date.UTC(2024, 0, 10, 15, 0, 0) / 1000);
+  });
+
+  it('snaps to the UTC day when charting in UTC', () => {
+    expect(appliedMarkerTime('UTC')).toBe(
+      Date.UTC(2024, 0, 10, 15, 0, 0) / 1000
+    );
+  });
+});

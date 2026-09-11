@@ -212,7 +212,13 @@ print(label_kind(1_704_153_600))  # utc_timestamp
 print(label_kind("2024-01-02"))  # other
 ```
 
-Display timezone is a UI concern: the chart renders the same UTC second the same way regardless of the viewer's locale. For "show in NY time", use a chart-level locale or pre-shift the data.
+## Time zones and daylight saving
+
+Charts render times in the time zone from your Deephaven **Settings**, falling back to the browser's zone when unset. The offset is resolved per timestamp, so a series spanning a daylight saving transition keeps correct labels on both sides of it, and day gridlines land on local midnight.
+
+The chart's underlying coordinate is always UTC. Only the axis ticks and labels are zone-aware, so every row keeps a distinct position even when two instants share the same local wall-clock time. Both instants of an autumn "fall back" hour — for example `05:30 UTC` (01:30 EDT) and `06:30 UTC` (01:30 EST) in `America/New_York` — plot separately.
+
+Changing the Settings time zone re-labels and re-ticks the axis in place; the data and your current zoom are unaffected.
 
 ## API Reference
 

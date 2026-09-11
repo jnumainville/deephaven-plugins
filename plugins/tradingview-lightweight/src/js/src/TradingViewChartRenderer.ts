@@ -1,5 +1,5 @@
 import {
-  createChart,
+  createChartEx,
   createYieldCurveChart,
   createOptionsChart,
   createSeriesMarkers,
@@ -40,6 +40,10 @@ import type {
   TvlTooltipOptions,
 } from './TradingViewTypes';
 import { resolveColor, resolveColorsDeep } from './TradingViewColors';
+import createTimeZoneHorzScaleBehavior, {
+  type ZonedHorzScaleBehavior,
+} from './TimeZoneHorzScaleBehavior';
+import { getTimezoneOffsetSeconds } from './TradingViewUtils';
 import { TradingViewTooltip } from './TradingViewTooltip';
 import ContinuousBarsSeries, {
   isContinuousBarType,
@@ -341,6 +345,11 @@ class TradingViewChartRenderer {
 
   private chartType: TvlChartType;
 
+  /** Display zone for axis ticks/labels; the data coordinate stays UTC. */
+  private timeZone: string | undefined;
+
+  private horzScaleBehavior: ZonedHorzScaleBehavior | null = null;
+
   private seriesMap: Map<string, ISeriesApi<SeriesType>> = new Map();
 
   /** Resolved primary color per series id, used to tint the tracking tooltip. */
@@ -428,10 +437,12 @@ class TradingViewChartRenderer {
   constructor(
     container: HTMLElement,
     options: DeepPartial<ChartOptions> = {},
-    chartType: TvlChartType = 'standard'
+    chartType: TvlChartType = 'standard',
+    timeZone?: string
   ) {
     this.container = container;
     this.chartType = chartType;
+    this.timeZone = timeZone;
 
     // Extract watermark and resolve localization before passing to createChart.
     // Resolve DH theme color names (e.g. "accent-300") to canvas-paintable
@@ -473,7 +484,15 @@ class TradingViewChartRenderer {
     const chartOpts = this.resolvedChartOpts;
     const resolvedTextColor = this.textColor;
     let tickMarkFormatter = defaultTickMarkFormatter;
-    let timeFormatter = crosshairTimeFormatter;
+    // localization.timeFormatter is called by the library with the raw chart
+    // time, outside the horizontal scale behavior, so it has to apply the zone
+    // shift itself. Read this.timeZone at call time so a zone change takes
+    // effect without rebuilding the chart.
+    let timeFormatter = (time: unknown): string =>
+      crosshairTimeFormatter(
+        (time as number) +
+          getTimezoneOffsetSeconds((time as number) * 1000, this.timeZone)
+      );
     if (chartType === 'yieldCurve') {
       tickMarkFormatter = yieldCurveTickMarkFormatter;
       timeFormatter = yieldCurveCrosshairFormatter;
@@ -548,11 +567,27 @@ class TradingViewChartRenderer {
           commonOpts as DeepPartial<PriceChartOptions>
         ) as unknown as IChartApi;
       default:
-        return createChart(
+        // Zone-aware behavior keeps the data coordinate in true UTC while day
+        // ticks still land on local midnight. Shifting the data instead makes
+        // the coordinate local wall-clock time, which is ambiguous across a
+        // DST fall back and silently drops a row.
+        this.horzScaleBehavior = createTimeZoneHorzScaleBehavior(this.timeZone);
+        return createChartEx(
           this.container,
+          this.horzScaleBehavior,
           commonOpts as DeepPartial<ChartOptions>
         );
     }
+  }
+
+  /** Re-label and re-tick for a new zone without rebuilding the chart. */
+  setTimeZone(timeZone: string | undefined): void {
+    this.timeZone = timeZone;
+    this.horzScaleBehavior?.setTimeZone(timeZone);
+    // Formatted tick labels are cached per weight. Only the time scale's own
+    // applyOptions clears that cache, and the chart only forwards to it when
+    // a timeScale key is actually present — an empty object is enough.
+    this.chart.applyOptions({ timeScale: {} });
   }
 
   /**
@@ -995,10 +1030,10 @@ class TradingViewChartRenderer {
    * swaps) are not guaranteed to arrive in time order.
    */
   private static sortByTime(data: unknown[]): unknown[] {
-    const timeOf = (d: unknown): number =>
-      TradingViewChartRenderer.markerTimeToNumber(
-        (d as { time?: Time })?.time as Time
-      ) ?? Number.NEGATIVE_INFINITY;
+    const timeOf = (d: unknown): number => {
+      const t = (d as { time?: unknown })?.time;
+      return typeof t === 'number' ? t : Number.NEGATIVE_INFINITY;
+    };
     let ascending = true;
     for (let i = 1; i < data.length; i += 1) {
       if (timeOf(data[i]) < timeOf(data[i - 1])) {
@@ -1067,17 +1102,25 @@ class TradingViewChartRenderer {
    * a number, a `YYYY-MM-DD` string, or a `{year, month, day}` business day;
    * series data times are always numbers.
    */
-  private static markerTimeToNumber(time: Time): number | null {
+  private markerTimeToNumber(time: Time): number | null {
     if (typeof time === 'number') return time;
+    // A calendar day means that day in the DISPLAY zone, so resolve it to the
+    // instant of local midnight. Chart times are UTC; using UTC midnight here
+    // would snap the marker to whichever bar is nearest that instant, which
+    // for a zone behind UTC is the previous day's bar.
+    const localMidnight = (utcMidnightSec: number): number =>
+      utcMidnightSec -
+      getTimezoneOffsetSeconds(utcMidnightSec * 1000, this.timeZone);
+
     if (typeof time === 'string') {
-      const ms = Date.parse(
-        /^\d{4}-\d{2}-\d{2}$/.test(time) ? `${time}T00:00:00Z` : time
-      );
-      return Number.isNaN(ms) ? null : ms / 1000;
+      const isDay = /^\d{4}-\d{2}-\d{2}$/.test(time);
+      const ms = Date.parse(isDay ? `${time}T00:00:00Z` : time);
+      if (Number.isNaN(ms)) return null;
+      return isDay ? localMidnight(ms / 1000) : ms / 1000;
     }
     const bd = time as { year?: number; month?: number; day?: number };
     if (bd?.year != null && bd.month != null && bd.day != null) {
-      return Date.UTC(bd.year, bd.month - 1, bd.day) / 1000;
+      return localMidnight(Date.UTC(bd.year, bd.month - 1, bd.day) / 1000);
     }
     return null;
   }
@@ -1094,12 +1137,9 @@ class TradingViewChartRenderer {
    * Date-string marker times need this too: midnight essentially never
    * coincides with the bar's real timestamp.
    */
-  private static snapMarkerTime(
-    time: Time,
-    dataTimes: readonly number[]
-  ): Time {
+  private snapMarkerTime(time: Time, dataTimes: readonly number[]): Time {
     if (dataTimes.length === 0) return time;
-    const target = TradingViewChartRenderer.markerTimeToNumber(time);
+    const target = this.markerTimeToNumber(time);
     if (target == null) return time;
     // dataTimes is ascending (series data is time-ordered).
     let lo = 0;
@@ -1111,9 +1151,28 @@ class TradingViewChartRenderer {
     }
     const after = dataTimes[lo];
     const before = lo > 0 ? dataTimes[lo - 1] : after;
+
+    // A calendar day resolves to local midnight, and that day's bar is always
+    // after it. Nearest-wins would pick the PREVIOUS day's bar whenever the
+    // session opens later in the day than the gap behind it (e.g. daily bars
+    // at 10:00 are 9h behind midnight but 15h ahead of it).
+    if (
+      TradingViewChartRenderer.isCalendarDay(time) &&
+      after >= target &&
+      after - target < 86400
+    ) {
+      return after as Time;
+    }
     return (
       Math.abs(after - target) < Math.abs(target - before) ? after : before
     ) as Time;
+  }
+
+  /** Markers given as `YYYY-MM-DD` or `{year, month, day}` mean a whole day. */
+  private static isCalendarDay(time: Time): boolean {
+    if (typeof time === 'string') return /^\d{4}-\d{2}-\d{2}$/.test(time);
+    const bd = time as { year?: number; month?: number; day?: number };
+    return bd?.year != null && bd.month != null && bd.day != null;
   }
 
   /**
@@ -1151,10 +1210,7 @@ class TradingViewChartRenderer {
 
     const chartMarkers: SeriesMarker<Time>[] = markers.map(m => {
       const raw = this.resolveMarkerColor(m);
-      const time = TradingViewChartRenderer.snapMarkerTime(
-        m.time as Time,
-        dataTimes
-      );
+      const time = this.snapMarkerTime(m.time as Time, dataTimes);
       // Explicit price: LWC otherwise infers it from the series row and
       // silently leaves the marker unpositioned when the row shape isn't one
       // it recognizes (the custom-series case).

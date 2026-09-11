@@ -219,7 +219,7 @@ export function buildPressEventPayload(
   // seconds; undo the shift before sending UTC nanoseconds.
   const { time } = params;
   if (time != null && typeof time === 'number') {
-    const utcSec = unconvertTime(time, timeZone);
+    const utcSec = unconvertTime(time);
     payload.timeNs = Math.round(utcSec * 1e9);
     if (timeZone) {
       payload.timeZone = timeZone;

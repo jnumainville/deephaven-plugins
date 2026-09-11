@@ -68,6 +68,34 @@ function render(
   }
 }
 
+describe('lightweight-charts sub-second time support', () => {
+  it('keeps fractional-second timestamps as distinct points', () => {
+    // The library's own docs use `(Date.now() / 1000) as UTCTimestamp`, which
+    // is fractional. If these 20 points survive, whole-second truncation is
+    // our constraint, not the library's.
+    const points = [];
+    for (let i = 0; i < 20; i += 1) {
+      points.push({ time: T0 + i * 0.05, value: i + 1 });
+    }
+
+    const stored = render(points);
+
+    expect(stored).toHaveLength(20);
+    expect(stored.map(d => d.value)).toEqual(points.map(p => p.value));
+  });
+
+  it('orders fractional times correctly against whole seconds', () => {
+    const stored = render([
+      { time: T0, value: 1 },
+      { time: T0 + 0.25, value: 2 },
+      { time: T0 + 0.5, value: 3 },
+      { time: T0 + 1, value: 4 },
+    ]);
+
+    expect(stored.map(d => d.value)).toEqual([1, 2, 3, 4]);
+  });
+});
+
 describe('lightweight-charts treatment of Deephaven-shaped values', () => {
   it('rejects a null line value as invalid input', () => {
     // Production builds strip this assertion, so the null survives into the
